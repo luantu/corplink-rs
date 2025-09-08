@@ -7,24 +7,32 @@ pub struct Resp<T> {
     pub data: Option<T>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
     pub action: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
 pub struct RespCompany {
+    #[allow(dead_code)]
     pub name: String,
     pub zh_name: String,
     pub en_name: String,
     pub domain: String,
+    #[allow(dead_code)]
     pub enable_self_signed: bool,
+    #[allow(dead_code)]
     pub self_signed_cert: String,
+    #[allow(dead_code)]
     pub enable_public_key: bool,
+    #[allow(dead_code)]
     pub public_key: String,
 }
 
 #[derive(serde::Deserialize, Debug)]
 pub struct RespLoginMethod {
+    #[allow(dead_code)]
     pub login_enable_ldap: bool,
+    #[allow(dead_code)]
     pub login_enable: bool,
     pub login_orders: Vec<String>,
 }
@@ -38,6 +46,7 @@ pub struct RespTpsLoginMethod {
 
 #[derive(serde::Deserialize, Debug)]
 pub struct RespCorplinkLoginMethod {
+    #[allow(dead_code)]
     pub mfa: bool,
     pub auth: Vec<String>,
 }
@@ -51,6 +60,7 @@ pub struct RespLogin {
 #[derive(serde::Deserialize, Debug)]
 pub struct RespOtp {
     pub url: String,
+    #[allow(dead_code)]
     pub code: String,
 }
 
@@ -63,7 +73,9 @@ pub struct RespVpnInfo {
     pub protocol_mode: i32,
     // useless
     pub name: String,
+    #[allow(dead_code)]
     pub en_name: String,
+    #[allow(dead_code)]
     pub icon: String,
     pub id: i32,
     pub timeout: i32,
@@ -73,10 +85,14 @@ pub struct RespVpnInfo {
 pub struct RespWgExtraInfo {
     pub vpn_mtu: u32,
     pub vpn_dns: String,
+    #[allow(dead_code)]
     pub vpn_dns_backup: String,
+    #[allow(dead_code)]
     pub vpn_dns_domain_split: Option<Vec<String>>,
+    #[allow(dead_code)]
     pub vpn_route_full: Vec<String>,
     pub vpn_route_split: Vec<String>,
+    #[allow(dead_code)]
     pub v6_route_full: Vec<String>,
     pub v6_route_split: Option<Vec<String>>,
 }
@@ -88,5 +104,6 @@ pub struct RespWgInfo {
     pub ip_mask: String,
     pub public_key: String,
     pub setting: RespWgExtraInfo,
+    #[allow(dead_code)]
     pub mode: u32,
 }

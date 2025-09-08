@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{fs, io};
+use tokio::time::sleep;
 
 use cookie::Cookie as RawCookie;
 use cookie_store::{Cookie, CookieStore};
@@ -578,7 +579,7 @@ impl Client {
 
             log::info!(
                 "server name {}{}",
-                vpn.en_name,
+                vpn.name,
                 match latency {
                     -1 => " timeout".to_string(),
                     _ => format!(", latency {}ms", latency),
@@ -604,8 +605,12 @@ impl Client {
 
     // ping vpn and return latency in ms. Will return -1 on error
     async fn ping_vpn(&mut self, ip: String, api_port: u16) -> i64 {
+        // 设置重试次数为3次
+        const MAX_RETRIES: i32 = 3;
+        let mut retries = 0;
+        
+        // 配置cookie
         {
-            // config cookie
             let mut cookie = self.cookie.lock().unwrap();
             let server_url = self.conf.server.clone().unwrap();
 
@@ -627,25 +632,46 @@ impl Client {
             self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
         }
         self.save_cookie();
-        let req_start = Utc::now().timestamp_millis();
-        let result = self.request::<String>(ApiName::PingVPN, None).await;
-        let req_end = Utc::now().timestamp_millis();
-        let latency = req_end - req_start;
-        match result {
-            Ok(resp) => match resp.code {
-                0 => return latency,
-                _ => {
-                    log::warn!(
-                        "failed to ping vpn with error {}: {}",
-                        resp.code,
-                        resp.message.unwrap()
-                    );
-                }
-            },
-            Err(err) => {
-                log::warn!("failed to ping {}:{}: {}", ip, api_port, err);
+        
+        // 重试循环
+        while retries < MAX_RETRIES {
+            if retries > 0 {
+                log::info!("retrying ping to {}:{}, attempt {}/{}", ip, api_port, retries + 1, MAX_RETRIES);
+                // 每次重试前等待100ms
+                sleep(Duration::from_millis(100)).await;
             }
+            
+            let req_start = Utc::now().timestamp_millis();
+            let result = self.request::<String>(ApiName::PingVPN, None).await;
+            let req_end = Utc::now().timestamp_millis();
+            let latency = req_end - req_start;
+            
+            match result {
+                Ok(resp) => match resp.code {
+                    0 => return latency,
+                    _ => {
+                        log::warn!(
+                            "failed to ping vpn with error {}: {}",
+                            resp.code,
+                            resp.message.unwrap()
+                        );
+                    }
+                },
+                Err(err) => {
+                    // 特别处理连接超时错误
+                    if err.to_string().contains("Operation timed out") {
+                        log::warn!("failed to ping {}:{}: {} (attempt {}/{})
+", ip, api_port, err, retries + 1, MAX_RETRIES);
+                    } else {
+                        log::warn!("failed to ping {}:{}: {}", ip, api_port, err);
+                    }
+                }
+            }
+            
+            retries += 1;
         }
+        
+        // 所有重试都失败
         -1
     }
 
@@ -688,20 +714,25 @@ impl Client {
     pub async fn connect_vpn(&mut self) -> Result<WgConf, Error> {
         let vpn_info = self.list_vpn().await?;
 
-        log::info!(
-            "found {} vpn(s), details: {:?}",
-            vpn_info.len(),
-            vpn_info
-                .iter()
-                .map(|i| i.en_name.clone())
-                .collect::<Vec<String>>()
-        );
+        log::info!("found {} vpn(s)", vpn_info.len());
+        for vpn in &vpn_info {
+            log::info!(
+                "VPN server info: id={}, name={}, ip={}, api_port={}, vpn_port={}, protocol_mode={}, timeout={}",
+                vpn.id,
+                vpn.name,
+                vpn.ip,
+                vpn.api_port,
+                vpn.vpn_port,
+                vpn.protocol_mode,
+                vpn.timeout
+            );
+        }
         let filtered_vpn = vpn_info
             .into_iter()
             .filter(|vpn| {
                 if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
+                    if vpn.name != server_name {
+                        log::info!("skip {}, expect {}", vpn.name, server_name);
                         return false;
                     }
                 }
@@ -719,7 +750,7 @@ impl Client {
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
-                            vpn.en_name,
+                            vpn.name,
                             mode
                         );
                         false
@@ -742,7 +773,7 @@ impl Client {
             None => return Err(Error::Error("no vpn available".to_string())),
         };
         let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        log::info!("try connect to {}, address {}", vpn.name, vpn_addr);
 
         let key = self.conf.public_key.clone().unwrap();
         log::info!("try to get wg conf from remote");
