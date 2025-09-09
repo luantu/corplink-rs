@@ -11,6 +11,7 @@ mod utils;
 mod wg;
 
 use std::io::Write;
+use std::time::Duration;
 
 #[cfg(windows)]
 use is_elevated;
@@ -123,7 +124,7 @@ async fn main() {
             writeln!(
                 buf,
                 "{} [{}] {}",
-                local_time.format("%Y-%m-%d %H:%M:%S%.3f %:z"),
+                local_time.format("%Y-%m-%d %H:%M:%S%.3f"),
                 record.level(),
                 record.args()
             )
@@ -175,18 +176,44 @@ async fn main() {
     let mut logout_retry = true;
     let mut should_exit = false;
 
+    // 全局重试参数：最长重试时间为120分钟，初始重试间隔为5秒
+    const MAX_RETRY_TIME_MINUTES: u64 = 120;
+    const INITIAL_RETRY_INTERVAL_SECONDS: u64 = 5;
+    const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
+
     // 外层循环用于支持VPN重连
     loop {
         let wg_conf: Option<WgConf>;
         
-        // 登录和连接VPN的逻辑
+        // 登录和连接VPN的逻辑 - 添加全局重试机制
+        let start_retry_time = std::time::Instant::now();
+        let mut retry_interval = INITIAL_RETRY_INTERVAL_SECONDS;
+        let mut connection_attempts = 0;
+        
         loop {
-            if c.need_login() {
-                log::info!("not login yet, try to login");
-                c.login().await.unwrap();
-                log::info!("login success");
+            // 检查是否达到最大重试时间
+            if start_retry_time.elapsed().as_secs() > MAX_RETRY_TIME_MINUTES * 60 {
+                log::error!("Maximum retry time ({} minutes) reached. Exiting...", MAX_RETRY_TIME_MINUTES);
+                exit(ETIMEDOUT);
             }
-            log::info!("try to connect");
+            
+            connection_attempts += 1;
+            
+            if c.need_login() {
+                log::info!("not login yet, try to login (attempt {})", connection_attempts);
+                match c.login().await {
+                    Ok(_) => log::info!("login success"),
+                    Err(e) => {
+                        log::warn!("Login failed: {}", e);
+                        log::info!("Waiting {} seconds before retrying...", retry_interval);
+                        tokio::time::sleep(Duration::from_secs(retry_interval)).await;
+                        retry_interval = std::cmp::min(retry_interval * 2, MAX_RETRY_INTERVAL_SECONDS);
+                        continue;
+                    }
+                };
+            }
+            
+            log::info!("try to connect (attempt {})", connection_attempts);
             match c.connect_vpn().await {
                 Ok(conf) => {
                     wg_conf = Some(conf);
@@ -199,7 +226,30 @@ async fn main() {
                         logout_retry = false;
                         continue;
                     } else {
-                        panic!("{}", e);
+                        // 处理连接失败，进行重试
+                        log::warn!("Connection failed: {}", e);
+                        log::info!("Waiting {} seconds before retrying... (attempt {})", 
+                                retry_interval, connection_attempts);
+                        
+                        // 发送飞书通知
+                        let feishu_url = check_config.feishu_webhook_url.clone();
+                        let retry_msg = format!("⚠️ VPN连接失败！\n错误信息: {}\n将在 {} 秒后重试 (第 {} 次尝试)", 
+                                           e, retry_interval, connection_attempts);
+                        log::info!("{}", retry_msg);
+                        
+                        if let Err(msg_err) = send_feishu_message(&feishu_url, &retry_msg).await {
+                            log::warn!("Failed to send feishu message: {}", msg_err);
+                        }
+                        
+                        // 等待重试间隔时间
+                        tokio::time::sleep(Duration::from_secs(retry_interval)).await;
+                        // 指数退避重试间隔，但不超过最大间隔
+                        retry_interval = std::cmp::min(retry_interval * 2, MAX_RETRY_INTERVAL_SECONDS);
+                        
+                        // 重建Client，避免状态问题
+                        let new_conf = Config::from_file(&conf_file).await;
+                        c = Client::new(new_conf).unwrap();
+                        logout_retry = true;
                     }
                 }
             };
@@ -225,7 +275,7 @@ async fn main() {
                     tokio::spawn(async move {
                         match get_interface_address(&name_async) {
                             Ok(ip_address) => {
-                                let message = format!("✅ VPN连接成功！\n接口名称: {}\nIP地址: {}", name_async, ip_address);
+                                let message = format!("✅ [VPN连接成功] IP地址: {}", ip_address);
                                 log::info!("{}", message);
                                 
                                 // 更新配置文件中的代理server地址
@@ -243,7 +293,7 @@ async fn main() {
                                 // 将错误转换为字符串，确保Send安全
                                 let err_str = format!("{}", e);
                                 log::warn!("Failed to get interface address: {}", err_str);
-                                let message = format!("✅ VPN连接成功！\n接口名称: {}\n未能获取IP地址: {}", name_async, err_str);
+                                let message = format!("✅ [VPN连接成功] 未能获取IP地址: {}", err_str);
                                 log::warn!("{}", message);
                                 if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
                                     // 将错误转换为字符串，确保Send安全
@@ -334,7 +384,7 @@ async fn main() {
         // 发送重连通知到飞书
         let feishu_url = check_config.feishu_webhook_url.clone();
         tokio::spawn(async move {
-            let message = format!("❌ VPN连接断开，正在尝试重连...");
+            let message = format!("❌ [VPN连接断开] 正在尝试重连...");
             if let Err(e) = send_feishu_message(&feishu_url, &message).await {
                 // 将错误转换为字符串，确保Send安全
                 let err_str = format!("{}", e);
@@ -358,6 +408,21 @@ fn update_config_yaml(config_path: &str, new_server: &str, proxy_name: &str) -> 
         )));
     }
     
+    // 执行svn update命令
+    if let Some(dir) = Path::new(config_path).parent() {
+        let output = Command::new("svn")
+            .arg("update")
+            .current_dir(dir)
+            .output()?;
+        
+        if output.status.success() {
+            log::info!("Successfully updated SVN working copy");
+        } else {
+            let error_message = String::from_utf8_lossy(&output.stderr);
+            log::warn!("Failed to update SVN working copy: {}", error_message);
+        }
+    }
+
     // 读取YAML文件内容
     let yaml_content = fs::read_to_string(config_path)?;
     
