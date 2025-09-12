@@ -1,7 +1,9 @@
 use std::fmt;
 use tokio::fs;
+use std::fs as std_fs;
 
 use serde::{Deserialize, Serialize};
+use log::{warn};
 
 use crate::state::State;
 use crate::utils;
@@ -46,6 +48,9 @@ pub struct Config {
     pub vpn_server_name: Option<String>,
     pub vpn_select_strategy: Option<String>,
     pub use_vpn_dns: Option<bool>,
+    pub log_directory: Option<String>,
+    pub check_config_path: Option<String>,
+    pub log_level: Option<String>,
 }
 
 impl fmt::Display for Config {
@@ -130,4 +135,69 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+}
+
+// 检查配置结构体
+#[derive(Deserialize)]
+pub struct CheckConfig {
+    pub feishu_webhook_url: String,
+    // 可选字段，提供默认值
+    #[serde(default = "default_config_yaml_path")]
+    pub config_yaml_path: String,
+    #[serde(default = "default_proxy_name")]
+    pub proxy_name_to_update: String,
+    // SVN认证信息
+    #[serde(default = "default_svn_username")]
+    pub svn_username: String,
+    #[serde(default = "default_svn_password")]
+    pub svn_password: String,
+}
+
+fn default_config_yaml_path() -> String {
+    String::from("")
+}
+
+fn default_proxy_name() -> String {
+    String::from("")
+}
+
+fn default_svn_username() -> String {
+    String::from("")
+}
+
+fn default_svn_password() -> String {
+    String::from("")
+}
+
+/// 读取check_config.json配置文件
+pub fn read_check_config(config_path: Option<&str>) -> CheckConfig {
+    // 如果没有提供路径，使用默认路径
+    let config_path = config_path.unwrap_or("/Users/luantu/corplink/check_config.json");
+    match std_fs::read_to_string(config_path) {
+        Ok(content) => {
+            match serde_json::from_str(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    warn!("Failed to parse check_config.json: {}, using default values", e);
+                    CheckConfig {
+                        feishu_webhook_url: String::from("https://open.feishu.cn/open-apis/bot/v2/hook/d8a2f118-30db-4453-b141-9570dcd8ad20"),
+                        config_yaml_path: default_config_yaml_path(),
+                        proxy_name_to_update: default_proxy_name(),
+                        svn_username: default_svn_username(),
+                        svn_password: default_svn_password(),
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            warn!("Failed to read check_config.json: {}, using default values", e);
+            CheckConfig {
+                feishu_webhook_url: String::from("https://open.feishu.cn/open-apis/bot/v2/hook/d8a2f118-30db-4453-b141-9570dcd8ad20"),
+                config_yaml_path: default_config_yaml_path(),
+                proxy_name_to_update: default_proxy_name(),
+                svn_username: default_svn_username(),
+                svn_password: default_svn_password(),
+            }
+        }
+    }
 }

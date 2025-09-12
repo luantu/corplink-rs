@@ -1,9 +1,19 @@
 {
-    "company_name": "company code name",
-    "username": "your_name",
-    "password": "your_pass",
-    // will generate corplink.conf
-    "conf_name": "corplink",
-    // will generate conf in /etc/wireguard
-    "conf_dir": "/etc/wireguard"
+  "company_name": "",
+  "username": "",
+  "password": null,
+  "platform": null,
+  "code": "",
+  "device_name": "DollarOS",
+  "device_id": "",
+  "public_key": "",
+  "private_key": "",
+  "server": "",
+  "interface_name": "utun12",
+  "debug_wg": null,
+  "state": "Login",
+  "vpn_server_name": "",
+  "vpn_select_strategy": "latency",
+  "use_vpn_dns": null,
+  "log_directory": ""
 }

@@ -174,19 +174,37 @@ impl Client {
     }
 
     fn save_cookie(&self) {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(false)
-            .open(format!(
+        // 使用与Client::new相同的逻辑构建cookie文件路径
+        // 基于配置文件的父目录，避免在只读文件系统上写入
+        if let Some(conf_file) = &self.conf.conf_file {
+            let dir = match path::Path::new(&conf_file).parent() {
+                Some(dir) => dir,
+                None => path::Path::new("."),
+            };
+            let cookie_file = dir.join(format!(
                 "{}_{}",
                 self.conf.interface_name.clone().unwrap(),
                 COOKIE_FILE_SUFFIX
-            ))
-            .map(io::BufWriter::new)
-            .unwrap();
-        let c = self.cookie.lock().unwrap();
-        c.save_json(&mut file).unwrap();
+            ));
+            
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .append(false)
+                .open(&cookie_file)
+                .map(io::BufWriter::new)
+            {
+                let c = self.cookie.lock().unwrap();
+                if let Err(e) = c.save_json(&mut file) {
+                    log::error!("Failed to save cookie: {}", e);
+                }
+            } else {
+                log::error!("Failed to open cookie file for writing: {}", 
+                    cookie_file.to_str().unwrap_or("unknown path"));
+            }
+        } else {
+            log::error!("No configuration file path available to determine cookie file location");
+        }
     }
 
     async fn request<T: DeserializeOwned + fmt::Debug>(

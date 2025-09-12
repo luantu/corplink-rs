@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::io::{self, BufRead};
 use std::process::Command;
+use std::process::exit;
 
 use base32::Alphabet;
 use base64::Engine;
@@ -9,6 +10,15 @@ use rand::rngs::OsRng;
 use reqwest;
 use serde_json::json;
 use x25519_dalek::{PublicKey, StaticSecret};
+use log;
+
+#[cfg(unix)]
+use sudo;
+#[cfg(windows)]
+use is_elevated;
+
+// 定义常量错误码
+const EPERM: i32 = 1;
 
 pub async fn read_line() -> String {
     io::stdin().lock().lines().next().unwrap().unwrap()
@@ -91,6 +101,31 @@ pub fn get_interface_address(interface_name: &str) -> Result<String, String> {
             return Ok(ip_address.to_string());
         }
     }
-    
+
     Err("Interface address not found".to_string())
+}
+
+/// 检查用户权限
+pub fn check_privilege() {
+    #[cfg(unix)]
+    match sudo::escalate_if_needed() {
+        Ok(_) => {},
+        Err(_) => {
+            log::error!("please run as root");
+            exit(EPERM);
+        }
+    }
+
+    #[cfg(windows)]
+    if !is_elevated::is_elevated() {
+        log::error!("please run as administrator");
+        exit(EPERM);
+    }
+}
+
+/// 打印版本信息
+pub fn print_version() {
+    let pkg_name = env!("CARGO_PKG_NAME");
+    let pkg_version = env!("CARGO_PKG_VERSION");
+    log::info!("running {}@{}", pkg_name, pkg_version);
 }

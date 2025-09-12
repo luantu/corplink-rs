@@ -45,6 +45,7 @@ hmac-sha1 = "0.1"
 byteorder = "1.5"
 log = "0.4"
 env_logger = "0.10"
+flexi_logger = { version = "0.28", features = ["specfile", "colors"] }
 libc = "0.2"
 terminal_graphics = "0.1.5"
 qrcode = "0.14.1"

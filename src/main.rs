@@ -9,9 +9,110 @@ mod template;
 mod totp;
 mod utils;
 mod wg;
+mod yaml;
 
-use std::io::Write;
 use std::time::Duration;
+use log;
+use chrono::{DateTime, Local};
+use flexi_logger::{Logger, FileSpec, WriteMode, DeferredNow, Record, LoggerHandle, FlexiLoggerError};
+use std::path::PathBuf;
+
+/// 自定义日志格式
+fn log_format(writer: &mut dyn std::io::Write, now: &mut DeferredNow, record: &Record) -> std::io::Result<()> {
+    let local_time: DateTime<Local> = (*now.now()).into();
+    write!(
+        writer,
+        "{} [{}] {}",
+        local_time.format("%Y-%m-%d %H:%M:%S%.3f"),
+        record.level(),
+        record.args()
+    )
+}
+
+/// 初始化日志系统，使用指定的日志目录和日志级别或默认值
+fn initialize_logger(log_directory: Option<&str>, log_level: Option<&str>) -> LoggerHandle {
+    // 从配置中获取log_directory
+    let log_dir = if let Some(dir) = log_directory {
+        PathBuf::from(dir)
+    } else {
+        PathBuf::from(".")
+    };
+    
+    // 使用指定的日志级别或默认级别"info"
+    let log_level = log_level.unwrap_or("info");
+    
+    // 使用Box<dyn FnOnce()>统一闭包类型
+    let loggers: Vec<Box<dyn FnOnce() -> Result<LoggerHandle, FlexiLoggerError>>> = vec![
+        // 1. 配置文件指定的目录
+        Box::new(move || {
+            let log_file_path = FileSpec::default()
+                .directory(&log_dir)  // 使用配置文件中的日志目录
+                .basename("corplink")  // 日志文件基础名称
+                .suffix("log");  // 日志文件后缀
+            Logger::try_with_env_or_str(log_level)
+                .unwrap()
+                .log_to_file(log_file_path)
+                .write_mode(WriteMode::BufferAndFlush)
+                .format(log_format)
+                .duplicate_to_stderr(flexi_logger::Duplicate::All)
+                .start()
+        }),
+        // 2. 当前目录
+        Box::new(|| {
+            let log_file_path = FileSpec::default()
+                .directory(".")  // 日志文件放在程序当前目录
+                .basename("corplink")  // 日志文件基础名称
+                .suffix("log");  // 日志文件后缀
+            Logger::try_with_env_or_str(log_level)
+                .unwrap()
+                .log_to_file(log_file_path)
+                .write_mode(WriteMode::BufferAndFlush)
+                .format(log_format)
+                .duplicate_to_stderr(flexi_logger::Duplicate::All)
+                .start()
+        }),
+        // 3. 临时目录
+        Box::new(|| {
+            let temp_dir = std::env::temp_dir();
+            let log_file_path = FileSpec::default()
+                .directory(temp_dir)
+                .basename("corplink")
+                .suffix("log");
+            Logger::try_with_env_or_str(log_level)
+                .unwrap()
+                .log_to_file(log_file_path)
+                .write_mode(WriteMode::BufferAndFlush)
+                .format(log_format)
+                .duplicate_to_stderr(flexi_logger::Duplicate::All)
+                .start()
+        }),
+        // 4. 仅控制台输出（作为最后的备选）
+        Box::new(|| {
+            Logger::try_with_env_or_str(log_level)
+                .unwrap()
+                .format(log_format)
+                .duplicate_to_stderr(flexi_logger::Duplicate::All)
+                .start()
+        })
+    ];
+    
+    // 尝试初始化日志系统，使用第一个成功的配置
+    for logger in loggers {
+        if let Ok(handle) = logger() {
+            return handle;
+        }
+    }
+    
+    // 如果所有日志配置都失败，至少在控制台打印错误信息
+    eprintln!("[ERROR] Failed to initialize logger with all configurations. Continuing without file logging.");
+    // 使用基本的控制台日志作为最后的备选
+    Logger::try_with_env_or_str("info")
+        .unwrap()
+        .log_to_stdout()
+        .format(log_format)
+        .start()
+        .expect("Failed to initialize basic console logging")
+}
 
 #[cfg(windows)]
 use is_elevated;
@@ -19,16 +120,12 @@ use is_elevated;
 #[cfg(target_os = "macos")]
 use dns::DNSManager;
 
-use env_logger;
 use std::env;
-use std::fs;
-use std::path::Path;
-use std::process::{exit, Command};
-use serde::{Deserialize};
+use std::process::exit;
 
 use client::Client;
-use config::{Config, WgConf};
-use utils::{get_interface_address, send_feishu_message};
+use config::{Config, WgConf, read_check_config};
+use utils::{check_privilege, get_interface_address, print_version, send_feishu_message};
 
 fn print_usage_and_exit(name: &str, conf: &str) {
     println!("usage:\n\t{} {}", name, conf);
@@ -65,84 +162,65 @@ pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
 
-// 检查配置结构体
-#[derive(Deserialize)]
-struct CheckConfig {
-    feishu_webhook_url: String,
-    // 可选字段，提供默认值
-    #[serde(default = "default_config_yaml_path")]
-    config_yaml_path: String,
-    #[serde(default = "default_proxy_name")]
-    proxy_name_to_update: String,
-}
 
-fn default_config_yaml_path() -> String {
-    String::from("/Users/luantu/corplink/Pavadan/config.yaml")
-}
-
-fn default_proxy_name() -> String {
-    String::from("Home-Mac(7897)")
-}
-
-// 读取check_config.json配置文件
-fn read_check_config() -> CheckConfig {
-    let config_path = "/Users/luantu/corplink/check_config.json";
-    match fs::read_to_string(config_path) {
-        Ok(content) => {
-            match serde_json::from_str(&content) {
-                Ok(config) => config,
-                Err(e) => {
-                    log::warn!("Failed to parse check_config.json: {}, using default values", e);
-                    CheckConfig {
-                        feishu_webhook_url: String::from("https://open.feishu.cn/open-apis/bot/v2/hook/d8a2f118-30db-4453-b141-9570dcd8ad20"),
-                        config_yaml_path: default_config_yaml_path(),
-                        proxy_name_to_update: default_proxy_name(),
-                    }
-                }
-            }
-        },
-        Err(e) => {
-            log::warn!("Failed to read check_config.json: {}, using default values", e);
-            CheckConfig {
-                feishu_webhook_url: String::from("https://open.feishu.cn/open-apis/bot/v2/hook/d8a2f118-30db-4453-b141-9570dcd8ad20"),
-                config_yaml_path: default_config_yaml_path(),
-                proxy_name_to_update: default_proxy_name(),
-            }
-        }
-    }
-}
-
-use chrono::{Local, DateTime, Utc};
 
 #[tokio::main]
 async fn main() {
-    // 初始化日志系统，默认输出info及以上级别的日志到控制台
-    // 使用本地时区来显示时间戳
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            let local_time: DateTime<Local> = Utc::now().into();
-            writeln!(
-                buf,
-                "{} [{}] {}",
-                local_time.format("%Y-%m-%d %H:%M:%S%.3f"),
-                record.level(),
-                record.args()
-            )
-        })
-        .init();
-
-    // 读取check_config.json配置
-    let check_config = read_check_config();
-    log::info!("Using feishu webhook URL: {}", check_config.feishu_webhook_url);
-    log::info!("Using config.yaml path: {}", check_config.config_yaml_path);
-    log::info!("Using proxy name: {}", check_config.proxy_name_to_update);
+    // 先解析命令行参数获取配置文件路径
+    let conf_file = parse_arg();
+    // 提前克隆conf_file以避免借用问题
+    let conf_file_clone = conf_file.clone();
+    
+    // 尝试加载配置文件，即使失败也继续运行
+    let mut conf = match std::panic::catch_unwind(|| {
+        let file = conf_file.clone();
+        async move {
+            Config::from_file(&file).await
+        }
+    }) {
+        Ok(future) => future.await,
+        Err(_) => {
+            eprintln!("[ERROR] Failed to load config file, using default configuration");
+            Config {
+                company_name: String::from("default"),
+                username: String::from("user"),
+                password: None,
+                platform: None,
+                code: None,
+                device_name: Some(DEFAULT_DEVICE_NAME.to_string()),
+                device_id: None,
+                public_key: None,
+                private_key: None,
+                server: None,
+                interface_name: Some(DEFAULT_INTERFACE_NAME.to_string()),
+                debug_wg: None,
+                conf_file: Some(conf_file_clone),
+                state: None,
+                vpn_server_name: None,
+                vpn_select_strategy: None,
+                use_vpn_dns: None,
+                log_directory: None,
+                check_config_path: None,
+                log_level: None,
+            }
+        }
+    };
+    
+    // 初始化日志系统，使用配置文件中的log_directory和log_level设置
+    // 如果配置中没有提供，使用默认值
+    let _logger = initialize_logger(conf.log_directory.as_deref(), conf.log_level.as_deref());
+    
+    log::info!("CorpLink start...");
+    // 读取check_config.json配置，使用Config中定义的路径
+    let check_config = read_check_config(conf.check_config_path.as_deref());
+    log::info!("Feishu URL  : {}", check_config.feishu_webhook_url);
+    log::info!("Config Path : {}", check_config.config_yaml_path);
+    log::info!("Proxy Name  : {}", check_config.proxy_name_to_update);
 
     print_version();
     check_privilege();
 
-    let conf_file = parse_arg();
-    let mut conf = Config::from_file(&conf_file).await;
-    let name = conf.interface_name.clone().unwrap();
+    let name = conf.interface_name.clone().unwrap_or_else(|| DEFAULT_INTERFACE_NAME.to_string());
 
     #[cfg(target_os = "macos")]
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
@@ -176,10 +254,17 @@ async fn main() {
     let mut logout_retry = true;
     let mut should_exit = false;
 
-    // 全局重试参数：最长重试时间为120分钟，初始重试间隔为5秒
-    const MAX_RETRY_TIME_MINUTES: u64 = 120;
-    const INITIAL_RETRY_INTERVAL_SECONDS: u64 = 5;
-    const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_DEVICE_NAME: &str = "wg-corplink";
+const DEFAULT_INTERFACE_NAME: &str = "wg-corplink";
+
+// 全局重试参数：最长重试时间为120分钟，初始重试间隔为5秒
+const MAX_RETRY_TIME_MINUTES: u64 = 120;
+const INITIAL_RETRY_INTERVAL_SECONDS: u64 = 5;
+const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
+
+
+
+// Config结构体的实现已经在config.rs中定义
 
     // 外层循环用于支持VPN重连
     loop {
@@ -272,6 +357,8 @@ async fn main() {
                     let feishu_url = check_config.feishu_webhook_url.clone();
                     let config_yaml_path = check_config.config_yaml_path.clone();
                     let proxy_name = check_config.proxy_name_to_update.clone();
+                    let svn_username = check_config.svn_username.clone();
+                    let svn_password = check_config.svn_password.clone();
                     tokio::spawn(async move {
                         match get_interface_address(&name_async) {
                             Ok(ip_address) => {
@@ -279,7 +366,7 @@ async fn main() {
                                 log::info!("{}", message);
                                 
                                 // 更新配置文件中的代理server地址
-                                if let Err(e) = update_config_yaml(&config_yaml_path, &ip_address, &proxy_name) {
+                                if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
                                     log::warn!("Failed to update config.yaml: {}", e);
                                 } else {
                                     log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
@@ -395,111 +482,4 @@ async fn main() {
         // 重置登出重试标志
         logout_retry = true;
     }
-}
-
-/// 更新Pavadan/config.yaml文件中Home-Mac(7897)的server地址
-fn update_config_yaml(config_path: &str, new_server: &str, proxy_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // 检查文件是否存在
-    let path = Path::new(config_path);
-    if !path.exists() {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Config file not found: {}", config_path)
-        )));
-    }
-    
-    // 执行svn update命令
-    if let Some(dir) = Path::new(config_path).parent() {
-        let output = Command::new("svn")
-            .arg("update")
-            .current_dir(dir)
-            .output()?;
-        
-        if output.status.success() {
-            log::info!("Successfully updated SVN working copy");
-        } else {
-            let error_message = String::from_utf8_lossy(&output.stderr);
-            log::warn!("Failed to update SVN working copy: {}", error_message);
-        }
-    }
-
-    // 读取YAML文件内容
-    let yaml_content = fs::read_to_string(config_path)?;
-    
-    // 解析YAML内容
-    let mut config: serde_yaml::Value = serde_yaml::from_str(&yaml_content)?;
-    
-    // 查找proxies数组
-    if let Some(proxies) = config.get_mut("proxies").and_then(serde_yaml::Value::as_sequence_mut) {
-        // 遍历proxies数组，找到指定名称的项
-        for proxy in proxies {
-            if let Some(proxy_map) = proxy.as_mapping_mut() {
-                // 获取name字段
-                if let Some(serde_yaml::Value::String(name)) = proxy_map.get(&serde_yaml::Value::String("name".to_string())) {
-                    if name == proxy_name {
-                        // 更新server字段
-                        proxy_map.insert(
-                            serde_yaml::Value::String("server".to_string()),
-                            serde_yaml::Value::String(new_server.to_string())
-                        );
-                        log::info!("Found and updated {} with new server address: {}", proxy_name, new_server);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    // 将修改后的内容写回文件
-    fs::write(config_path, serde_yaml::to_string(&config)?)?;
-    log::info!("Successfully wrote updated config to {}", config_path);
-    
-    // 自动提交SVN变更
-    let config_dir = match Path::new(config_path).parent() {
-        Some(dir) => dir,
-        None => {
-            log::warn!("Failed to get parent directory of config file");
-            return Ok(());
-        }
-    };
-    
-    // 执行svn commit命令
-    let output = Command::new("svn")
-        .arg("commit")
-        .arg("-m")
-        .arg(format!("Update {} server address to {}", proxy_name, new_server))
-        .current_dir(config_dir)
-        .output()?;
-    
-    if output.status.success() {
-        log::info!("Successfully committed changes to SVN");
-    } else {
-        let error_message = String::from_utf8_lossy(&output.stderr);
-        log::warn!("Failed to commit changes to SVN: {}", error_message);
-    }
-    
-    Ok(())
-}
-
-fn check_privilege() {
-    #[cfg(unix)]
-    match sudo::escalate_if_needed() {
-        Ok(_) => {}
-        Err(_) => {
-            log::error!("please run as root");
-            exit(EPERM);
-        }
-    }
-
-    #[cfg(windows)]
-    if !is_elevated::is_elevated() {
-        log::error!("please run as administrator");
-        exit(EPERM);
-    }
-}
-
-fn print_version() {
-    let pkg_name = env!("CARGO_PKG_NAME");
-    let pkg_version = env!("CARGO_PKG_VERSION");
-    log::info!("running {}@{}", pkg_name, pkg_version);
 }
