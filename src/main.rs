@@ -233,9 +233,9 @@ async fn main() {
                         
                         // 发送飞书通知
                         let feishu_url = check_config.feishu_webhook_url.clone();
-                        let retry_msg = format!("⚠️ VPN连接失败！\n错误信息: {}\n将在 {} 秒后重试 (第 {} 次尝试)", 
-                                           e, retry_interval, connection_attempts);
-                        log::info!("{}", retry_msg);
+                        let retry_msg = format!("⚠️ [VPN连接失败] 将在 {} 秒后重试 (第 {} 次尝试)", 
+                                           retry_interval, connection_attempts);
+                        log::info!("{}\n{}", retry_msg, e);
                         
                         if let Err(msg_err) = send_feishu_message(&feishu_url, &retry_msg).await {
                             log::warn!("Failed to send feishu message: {}", msg_err);

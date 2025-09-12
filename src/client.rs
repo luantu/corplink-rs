@@ -811,13 +811,27 @@ impl Client {
     }
 
     pub async fn keep_alive_vpn(&mut self, conf: &WgConf, interval: u64) {
+        let mut consecutive_errors = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+        
         loop {
-            log::info!("keep alive");
             match self.report_vpn_status(conf).await {
-                Ok(_) => (),
+                Ok(_) => {
+                    // 成功时重置错误计数器
+                    consecutive_errors = 0;
+                }
                 Err(err) => {
-                    log::warn!("keep alive error: {}", err);
-                    return;
+                    consecutive_errors += 1;
+                    log::warn!("keep alive error (retry count {}): {}", consecutive_errors, err);
+                    
+                    // 如果连续错误超过5次，则返回
+                    if consecutive_errors > MAX_CONSECUTIVE_ERRORS {
+                        log::error!("Too many consecutive errors, giving up");
+                        return;
+                    }
+                    
+                    // 等待5秒后重试
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                 }
             }
             tokio::time::sleep(Duration::from_secs(interval)).await;
