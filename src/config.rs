@@ -151,6 +151,9 @@ pub struct CheckConfig {
     pub svn_username: String,
     #[serde(default = "default_svn_password")]
     pub svn_password: String,
+    // 控制是否发送VPN断开重连通知
+    #[serde(default = "default_send_disconnect_notification")]
+    pub send_disconnect_notification: bool,
 }
 
 fn default_config_yaml_path() -> String {
@@ -169,6 +172,11 @@ fn default_svn_password() -> String {
     String::from("")
 }
 
+fn default_send_disconnect_notification() -> bool {
+    // 默认发送断开重连通知，保持向后兼容性
+    true
+}
+
 /// 读取check_config.json配置文件
 pub fn read_check_config(config_path: Option<&str>) -> CheckConfig {
     // 如果没有提供路径，使用默认路径
@@ -185,6 +193,7 @@ pub fn read_check_config(config_path: Option<&str>) -> CheckConfig {
                         proxy_name_to_update: default_proxy_name(),
                         svn_username: default_svn_username(),
                         svn_password: default_svn_password(),
+                        send_disconnect_notification: default_send_disconnect_notification(),
                     }
                 }
             }
@@ -192,12 +201,13 @@ pub fn read_check_config(config_path: Option<&str>) -> CheckConfig {
         Err(e) => {
             warn!("Failed to read check_config.json: {}, using default values", e);
             CheckConfig {
-                feishu_webhook_url: String::from("https://open.feishu.cn/open-apis/bot/v2/hook/d8a2f118-30db-4453-b141-9570dcd8ad20"),
-                config_yaml_path: default_config_yaml_path(),
-                proxy_name_to_update: default_proxy_name(),
-                svn_username: default_svn_username(),
-                svn_password: default_svn_password(),
-            }
+                        feishu_webhook_url: String::from("https://open.feishu.cn/open-apis/bot/v2/hook/d8a2f118-30db-4453-b141-9570dcd8ad20"),
+                        config_yaml_path: default_config_yaml_path(),
+                        proxy_name_to_update: default_proxy_name(),
+                        svn_username: default_svn_username(),
+                        svn_password: default_svn_password(),
+                        send_disconnect_notification: default_send_disconnect_notification(),
+                    }
         }
     }
 }

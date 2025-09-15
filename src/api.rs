@@ -63,8 +63,8 @@ pub struct ApiUrl {
 
 impl ApiUrl {
     pub fn new(conf: &Config) -> ApiUrl {
-        let os = "Android".to_string();
-        let version = "2".to_string();
+        let os = "Windows".to_string();
+        let version = "11".to_string();
         let mut api_template = HashMap::new();
 
         api_template.insert(ApiName::LoginMethod, Template::new(URL_GET_LOGIN_METHOD));

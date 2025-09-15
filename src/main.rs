@@ -468,16 +468,20 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         log::info!("preparing to reconnect VPN...");
         
-        // 发送重连通知到飞书
-        let feishu_url = check_config.feishu_webhook_url.clone();
-        tokio::spawn(async move {
-            let message = format!("❌ [VPN连接断开] 正在尝试重连...");
-            if let Err(e) = send_feishu_message(&feishu_url, &message).await {
-                // 将错误转换为字符串，确保Send安全
-                let err_str = format!("{}", e);
-                log::warn!("Failed to send feishu message: {}", err_str);
-            }
-        });
+        // 发送重连通知到飞书（如果配置允许）
+        if check_config.send_disconnect_notification {
+            let feishu_url = check_config.feishu_webhook_url.clone();
+            tokio::spawn(async move {
+                let message = format!("❌ [VPN连接断开] 正在尝试重连...");
+                if let Err(e) = send_feishu_message(&feishu_url, &message).await {
+                    // 将错误转换为字符串，确保Send安全
+                    let err_str = format!("{}", e);
+                    log::warn!("Failed to send feishu message: {}", err_str);
+                }
+            });
+        } else {
+            log::info!("VPN断开重连通知已禁用");
+        }
         
         // 重置登出重试标志
         logout_retry = true;
