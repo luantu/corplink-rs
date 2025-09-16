@@ -2,6 +2,8 @@
 
 使用 rust 实现的 [飞连][1] 客户端，支持 Linux/Windows10/MacOS
 
+# 增加了一堆乱七八糟的个人使用功能，纯定制不建议使用。
+
 # 安装
 
 ## ArchLinux
