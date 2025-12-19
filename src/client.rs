@@ -5,7 +5,7 @@ use std::path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::{fs, io};
+use std::{fs, io::{self, BufRead}};
 use tokio::time::sleep;
 
 use cookie::Cookie as RawCookie;
@@ -45,6 +45,27 @@ impl fmt::Display for Error {
                 write!(f, "{}", err)
             }
         }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::ReqwestError(err) => Some(err),
+            Error::Error(_) => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(err: anyhow::Error) -> Self {
+        Error::Error(err.to_string())
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(err: reqwest::Error) -> Self {
+        Error::ReqwestError(err)
     }
 }
 
@@ -170,7 +191,7 @@ impl Client {
 
     async fn change_state(&mut self, state: State) {
         self.conf.state = Some(state);
-        self.conf.save().await;
+        let _ = self.conf.save().await;
     }
 
     fn save_cookie(&self) {
@@ -241,13 +262,28 @@ impl Client {
                 break;
             }
         }
-        let resp = resp.json::<Resp<T>>().await;
-        if let Err(err) = resp {
-            return Err(Error::ReqwestError(err));
+        
+        // 添加详细日志，输出原始响应内容，帮助定位JSON解析错误
+        let raw_body = resp.text().await;
+        match raw_body {
+            Ok(body) => {
+                log::debug!("api {:#?} raw resp: {}", api, body);
+                let resp: Resp<T> = match serde_json::from_str(&body) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        log::error!("failed to parse response: {}", err);
+                        log::error!("response body: {}", body);
+                        return Err(Error::Error(format!("failed to parse response: {}", err)));
+                    }
+                };
+                log::debug!("api {:#?} parsed resp: {:#?}", api, resp);
+                Ok(resp)
+            },
+            Err(err) => {
+                log::error!("failed to read response body: {}", err);
+                return Err(Error::ReqwestError(err));
+            }
         }
-        let resp = resp.unwrap();
-        log::debug!("api {:#?} resp: {:#?}", api, resp);
-        Ok(resp)
     }
 
     fn parse_time_offset_from_date_header(&mut self, resp: &Response) {
@@ -308,48 +344,39 @@ impl Client {
             PLATFORM_LARK | PLATFORM_OIDC => {
                 log::info!("请在完成扫码验证后输入 'y' 继续");
                 let mut confirmed = false;
-                let mut attempts = 0;
-                const MAX_ATTEMPTS: usize = 3;
                 
-                // 简化输入处理，更好地处理管道输入和EOF情况
-                let mut input = String::new();
-                while !confirmed && attempts < MAX_ATTEMPTS {
-                    attempts += 1;
-                    match io::stdin().read_line(&mut input) {
-                        Ok(0) => {
-                            // 读取到EOF（可能是管道），等待后自动继续
-                            log::info!("检测到非交互式输入，等待3秒后自动继续...");
-                            std::thread::sleep(std::time::Duration::from_secs(3));
-                            confirmed = true;
-                            break;
-                        },
-                        Ok(_) => {
-                            let input_str = input.trim().to_lowercase();
-                            // 处理可能的空输入或特殊情况
-                            if input_str == "y" || input_str == "Y" || input_str.is_empty() {
-                                confirmed = true;
+                // 持续等待用户输入，直到用户输入 'y' 或 'Y'
+                while !confirmed {
+                    let mut input = String::new();
+                    
+                    // 使用std::io::stdin().lock()来确保正确的输入缓冲处理
+                    let stdin = io::stdin();
+                    let mut lock = stdin.lock();
+                    
+                    match lock.read_line(&mut input) {
+                        Ok(n) => {
+                            if n > 0 {
+                                // 成功读取到输入
+                                let input_str = input.trim().to_lowercase();
+                                if input_str == "y" || input_str == "Y" {
+                                    confirmed = true;
+                                } else {
+                                    log::info!("输入无效，请输入 'y' 以继续");
+                                }
                             } else {
-                                log::info!("输入无效，请输入 'y' 以继续");
-                                input.clear(); // 清空输入缓冲区
+                                // 读取到EOF（可能是管道），等待后自动继续
+                                log::info!("检测到非交互式输入，等待10秒后自动继续...");
+                                std::thread::sleep(std::time::Duration::from_secs(10));
+                                // 设为true，避免无限循环
+                                confirmed = true;
                             }
                         },
                         Err(e) => {
                             log::error!("读取输入失败: {}", e);
                             // 出错后等待一小段时间，避免无限循环
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                            // 遇到错误时也允许继续，避免卡住
-                            if attempts >= MAX_ATTEMPTS - 1 {
-                                log::warn!("多次尝试读取输入失败，继续执行...");
-                                break;
-                            }
+                            std::thread::sleep(std::time::Duration::from_secs(2));
                         }
                     }
-                }
-                
-                // 如果尝试次数过多或无法确认，等待一段时间后继续
-                if !confirmed {
-                    log::warn!("未收到确认输入，等待3秒后继续...");
-                    std::thread::sleep(std::time::Duration::from_secs(3));
                 }
                 
                 self.check_tps_token(token).await
@@ -414,7 +441,7 @@ impl Client {
 
     async fn request_otp_code(&mut self) -> Result<String, Error> {
         let m = Map::new();
-        let resp = self.request::<RespOtp>(ApiName::OTP, Some(m)).await?;
+        let resp = self.request::<RespOtp>(ApiName::Otp, Some(m)).await?;
         match resp.code {
             0 => Ok(resp.data.unwrap().url),
             _ => {
@@ -496,7 +523,7 @@ impl Client {
                 if k == "secret" {
                     log::info!("got 2fa token: {}", &v);
                     self.conf.code = Some(v.to_string());
-                    self.conf.save().await;
+                    let _ = self.conf.save().await;
                     break;
                 }
             }
@@ -589,7 +616,7 @@ impl Client {
         self.request_email_code().await?;
 
         log::info!("input your code from email:");
-        let input = utils::read_line().await;
+        let input = utils::read_line().await?;
         let code = input.trim();
         let mut m = Map::new();
         m.insert("forget_password".to_string(), json!(false));
@@ -629,43 +656,8 @@ impl Client {
         }
     }
 
-    async fn get_first_vpn_by_latency(
-        &mut self,
-        vpn_info: Vec<RespVpnInfo>,
-    ) -> Option<RespVpnInfo> {
-        let mut fast_vpn = None;
-        let mut min_latency = i64::MAX;
-        for vpn in vpn_info {
-            let latency = self.ping_vpn(vpn.ip.clone(), vpn.api_port).await;
-
-            log::info!(
-                "server name {}{}",
-                vpn.name,
-                match latency {
-                    -1 => " timeout".to_string(),
-                    _ => format!(", latency {}ms", latency),
-                }
-            );
-            if latency != -1 && latency < min_latency {
-                fast_vpn = Some(vpn);
-                min_latency = latency;
-            }
-        }
-        fast_vpn
-    }
-
-    async fn get_first_available_vpn(&mut self, vpn_info: Vec<RespVpnInfo>) -> Option<RespVpnInfo> {
-        for vpn in vpn_info {
-            let latency = self.ping_vpn(vpn.ip.clone(), vpn.api_port.clone()).await;
-            if latency != -1 {
-                return Some(vpn);
-            }
-        }
-        None
-    }
-
-    // ping vpn and return latency in ms. Will return -1 on error
-    async fn ping_vpn(&mut self, ip: String, api_port: u16) -> i64 {
+    // 测试单个IP的延迟，返回延迟值（毫秒），-1表示测试失败
+    async fn ping_single_ip(&mut self, ip: String, api_port: u16) -> i64 {
         // 设置重试次数为3次
         const MAX_RETRIES: i32 = 3;
         let mut retries = 0;
@@ -736,11 +728,85 @@ impl Client {
         -1
     }
 
+    // 测试VPN服务器的所有可用IP（主IP + 备用IP），返回最佳IP和延迟
+    async fn ping_vpn_with_backup_ips(&mut self, vpn: &RespVpnInfo) -> (String, i64) {
+        let mut best_ip = vpn.ip.clone();
+        let mut best_latency = i64::MAX;
+        
+        // 收集所有要测试的IP
+        let mut ips_to_test = vec![vpn.ip.clone()];
+        
+        // 处理备用IP，如果存在的话
+        if let Some(backup_ips) = &vpn.backup_ips {
+            ips_to_test.extend(backup_ips.clone());
+        }
+        
+        // 测试每个IP的延迟
+        for ip in ips_to_test {
+            let latency = self.ping_single_ip(ip.clone(), vpn.api_port).await;
+            
+            if latency != -1 {
+                log::info!("{} - {}: latency {}ms", vpn.name, ip, latency);
+                if latency < best_latency {
+                    best_latency = latency;
+                    best_ip = ip.clone();
+                }
+            } else {
+                log::info!("{} - {}: timeout", vpn.name, ip);
+            }
+        }
+        
+        if best_latency == i64::MAX {
+            // 所有IP都测试失败
+            (best_ip, -1)
+        } else {
+            (best_ip, best_latency)
+        }
+    }
+
+    async fn get_first_vpn_by_latency(
+        &mut self,
+        vpn_info: Vec<RespVpnInfo>,
+    ) -> Option<RespVpnInfo> {
+        let mut fast_vpn = None;
+        let mut min_latency = i64::MAX;
+        
+        for mut vpn in vpn_info {
+            let (best_ip, latency) = self.ping_vpn_with_backup_ips(&vpn).await;
+            
+            // 如果找到更好的IP，更新VPN的主IP
+            if latency != -1 && latency < min_latency {
+                vpn.ip = best_ip;
+                fast_vpn = Some(vpn);
+                min_latency = latency;
+            }
+        }
+        fast_vpn
+    }
+
+    async fn get_first_available_vpn(&mut self, vpn_info: Vec<RespVpnInfo>) -> Option<RespVpnInfo> {
+        for mut vpn in vpn_info {
+            let (best_ip, latency) = self.ping_vpn_with_backup_ips(&vpn).await;
+            if latency != -1 {
+                // 使用找到的最佳IP
+                vpn.ip = best_ip;
+                return Some(vpn);
+            }
+        }
+        None
+    }
+
+    // ping vpn and return latency in ms. Will return -1 on error
+    // 保留原方法，供其他地方调用，直接调用ping_single_ip方法
+    async fn ping_vpn(&mut self, ip: String, api_port: u16) -> i64 {
+        self.ping_single_ip(ip, api_port).await
+    }
+
     async fn fetch_peer_info(&mut self, public_key: &String) -> Result<RespWgInfo, Error> {
         let mut otp = String::new();
         if let Some(code) = &self.conf.code {
             if !code.is_empty() {
-                let code = utils::b32_decode(code);
+                let code = utils::b32_decode(code)?;
                 let offset = self.date_offset_sec / TIME_STEP as i32;
                 let raw_otp = totp_offset(code.as_slice(), offset);
                 otp = format!("{:06}", raw_otp.code);
@@ -753,7 +819,7 @@ impl Client {
         }
         if otp.is_empty() {
             log::info!("input your 2fa code:");
-            otp = utils::read_line().await;
+            otp = utils::read_line().await?;
         }
         let mut m = Map::new();
         m.insert("public_key".to_string(), json!(public_key));

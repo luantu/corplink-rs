@@ -165,7 +165,7 @@ pub const ETIMEDOUT: i32 = 110;
 
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     // 先解析命令行参数获取配置文件路径
     let conf_file = parse_arg();
     // 提前克隆conf_file以避免借用问题
@@ -181,7 +181,7 @@ async fn main() {
         Ok(future) => future.await,
         Err(_) => {
             eprintln!("[ERROR] Failed to load config file, using default configuration");
-            Config {
+            Ok(Config {
                 company_name: String::from("default"),
                 username: String::from("user"),
                 password: None,
@@ -202,9 +202,9 @@ async fn main() {
                 log_directory: None,
                 check_config_path: None,
                 log_level: None,
-            }
+            })
         }
-    };
+    }?;
     
     // 初始化日志系统，使用配置文件中的log_directory和log_level设置
     // 如果配置中没有提供，使用默认值
@@ -236,7 +236,7 @@ async fn main() {
                     resp.domain
                 );
                 conf.server = Some(resp.domain);
-                conf.save().await;
+                let _ = conf.save().await;
             }
             Err(err) => {
                 log::error!(
@@ -250,7 +250,7 @@ async fn main() {
     }
 
     let with_wg_log = conf.debug_wg.unwrap_or_default();
-    let mut c = Client::new(conf).unwrap();
+    let mut c = Client::new(conf)?;
     let mut logout_retry = true;
     let mut should_exit = false;
 
@@ -332,8 +332,8 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
                         retry_interval = std::cmp::min(retry_interval * 2, MAX_RETRY_INTERVAL_SECONDS);
                         
                         // 重建Client，避免状态问题
-                        let new_conf = Config::from_file(&conf_file).await;
-                        c = Client::new(new_conf).unwrap();
+                        let new_conf = Config::from_file(&conf_file).await?;
+                        c = Client::new(new_conf)?;
                         logout_retry = true;
                     }
                 }
@@ -345,57 +345,48 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
         log::info!("start wg-corplink for {}", &name_clone);
         let wg_conf = wg_conf.unwrap();
         let protocol = wg_conf.protocol;
-        if !wg::start_wg_go(&name_clone, protocol, with_wg_log) {
-            log::warn!("failed to start wg-corplink for {}", name_clone);
-            exit(EPERM);
-        }
+        wg::start_wg_go(&name_clone, protocol, with_wg_log)?;
         let mut uapi = wg::UAPIClient { name: name_clone.clone() };
-        match uapi.config_wg(&wg_conf).await {
-            Ok(_) => {
-                // 获取接口地址并发送飞书消息
-                    let name_async = name_clone.clone();
-                    let feishu_url = check_config.feishu_webhook_url.clone();
-                    let config_yaml_path = check_config.config_yaml_path.clone();
-                    let proxy_name = check_config.proxy_name_to_update.clone();
-                    let svn_username = check_config.svn_username.clone();
-                    let svn_password = check_config.svn_password.clone();
-                    tokio::spawn(async move {
-                        match get_interface_address(&name_async) {
-                            Ok(ip_address) => {
-                                let message = format!("✅ [VPN连接成功] IP地址: {}", ip_address);
-                                log::info!("{}", message);
-                                
-                                // 更新配置文件中的代理server地址
-                                if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
-                                    log::warn!("Failed to update config.yaml: {}", e);
-                                } else {
-                                    log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
-                                }
-                                
-                                if let Err(e) = send_feishu_message(&feishu_url, &message).await {
-                                    log::warn!("Failed to send feishu message: {}", e);
-                                }
-                            },
-                            Err(e) => {
-                                // 将错误转换为字符串，确保Send安全
-                                let err_str = format!("{}", e);
-                                log::warn!("Failed to get interface address: {}", err_str);
-                                let message = format!("✅ [VPN连接成功] 未能获取IP地址: {}", err_str);
-                                log::warn!("{}", message);
-                                if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
-                                    // 将错误转换为字符串，确保Send安全
-                                    let msg_err_str = format!("{}", msg_err);
-                                    log::warn!("Failed to send feishu message: {}", msg_err_str);
-                                }
-                            }
-                        }
-                    });
-            },
-            Err(err) => {
-                log::error!("failed to config interface with uapi for {}: {}", name_clone, err);
-                exit(EPERM);
+        uapi.config_wg(&wg_conf).await?;
+        
+        // 获取接口地址并发送飞书消息
+        let name_async = name_clone.clone();
+        let feishu_url = check_config.feishu_webhook_url.clone();
+        let config_yaml_path = check_config.config_yaml_path.clone();
+        let proxy_name = check_config.proxy_name_to_update.clone();
+        let svn_username = check_config.svn_username.clone();
+        let svn_password = check_config.svn_password.clone();
+        tokio::spawn(async move {
+            match get_interface_address(&name_async) {
+                Ok(ip_address) => {
+                    let message = format!("✅ [VPN连接成功] IP地址: {}", ip_address);
+                    log::info!("{}", message);
+                    
+                    // 更新配置文件中的代理server地址
+                    if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
+                        log::warn!("Failed to update config.yaml: {}", e);
+                    } else {
+                        log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
+                    }
+                    
+                    if let Err(e) = send_feishu_message(&feishu_url, &message).await {
+                        log::warn!("Failed to send feishu message: {}", e);
+                    }
+                },
+                Err(e) => {
+                    // 将错误转换为字符串，确保Send安全
+                    let err_str = format!("{}", e);
+                    log::warn!("Failed to get interface address: {}", err_str);
+                    let message = format!("✅ [VPN连接成功] 未能获取IP地址: {}", err_str);
+                    log::warn!("{}", message);
+                    if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
+                        // 将错误转换为字符串，确保Send安全
+                        let msg_err_str = format!("{}", msg_err);
+                        log::warn!("Failed to send feishu message: {}", msg_err_str);
+                    }
+                }
             }
-        }
+        });
 
         #[cfg(target_os = "macos")]
         let mut dns_manager = DNSManager::new();

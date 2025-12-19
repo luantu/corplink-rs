@@ -79,6 +79,7 @@ pub struct RespVpnInfo {
     pub icon: String,
     pub id: i32,
     pub timeout: i32,
+    pub backup_ips: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, Debug)]
