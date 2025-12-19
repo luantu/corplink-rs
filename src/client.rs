@@ -306,9 +306,52 @@ impl Client {
         code.print();
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
-                log::info!("press enter if you finish auth");
-                let stdin = io::stdin();
-                stdin.lines().next();
+                log::info!("请在完成扫码验证后输入 'y' 继续");
+                let mut confirmed = false;
+                let mut attempts = 0;
+                const MAX_ATTEMPTS: usize = 3;
+                
+                // 简化输入处理，更好地处理管道输入和EOF情况
+                let mut input = String::new();
+                while !confirmed && attempts < MAX_ATTEMPTS {
+                    attempts += 1;
+                    match io::stdin().read_line(&mut input) {
+                        Ok(0) => {
+                            // 读取到EOF（可能是管道），等待后自动继续
+                            log::info!("检测到非交互式输入，等待3秒后自动继续...");
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                            confirmed = true;
+                            break;
+                        },
+                        Ok(_) => {
+                            let input_str = input.trim().to_lowercase();
+                            // 处理可能的空输入或特殊情况
+                            if input_str == "y" || input_str == "Y" || input_str.is_empty() {
+                                confirmed = true;
+                            } else {
+                                log::info!("输入无效，请输入 'y' 以继续");
+                                input.clear(); // 清空输入缓冲区
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("读取输入失败: {}", e);
+                            // 出错后等待一小段时间，避免无限循环
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            // 遇到错误时也允许继续，避免卡住
+                            if attempts >= MAX_ATTEMPTS - 1 {
+                                log::warn!("多次尝试读取输入失败，继续执行...");
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // 如果尝试次数过多或无法确认，等待一段时间后继续
+                if !confirmed {
+                    log::warn!("未收到确认输入，等待3秒后继续...");
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                
                 self.check_tps_token(token).await
             }
             _ => {
@@ -792,6 +835,10 @@ impl Client {
         };
         let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
         log::info!("try connect to {}, address {}", vpn.name, vpn_addr);
+        
+        // 更新API URL参数，确保使用正确的VPN服务器地址
+        let server_url = format!("https://{}:{}", vpn.ip, vpn.api_port);
+        self.api_url.vpn_param.url = server_url;
 
         let key = self.conf.public_key.clone().unwrap();
         log::info!("try to get wg conf from remote");
