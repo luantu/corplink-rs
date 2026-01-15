@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                 log_directory: None,
                 check_config_path: None,
                 log_level: None,
+                intranet_domain: None,
             })
         }
     }?;
@@ -257,10 +258,10 @@ async fn main() -> anyhow::Result<()> {
 const DEFAULT_DEVICE_NAME: &str = "wg-corplink";
 const DEFAULT_INTERFACE_NAME: &str = "wg-corplink";
 
-// 全局重试参数：最长重试时间为120分钟，初始重试间隔为5秒
-const MAX_RETRY_TIME_MINUTES: u64 = 120;
+// 全局重试参数：最长重试时间为5分钟，初始重试间隔为5秒
+const MAX_RETRY_TIME_MINUTES: u64 = 1;
 const INITIAL_RETRY_INTERVAL_SECONDS: u64 = 5;
-const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
+const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
 
 
 
@@ -342,109 +343,153 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 60;
         
         // 在每次循环迭代中克隆name，避免借用问题
         let name_clone = name.clone();
-        log::info!("start wg-corplink for {}", &name_clone);
         let wg_conf = wg_conf.unwrap();
-        let protocol = wg_conf.protocol;
-        wg::start_wg_go(&name_clone, protocol, with_wg_log)?;
-        let mut uapi = wg::UAPIClient { name: name_clone.clone() };
-        uapi.config_wg(&wg_conf).await?;
-        
-        // 获取接口地址并发送飞书消息
-        let name_async = name_clone.clone();
-        let feishu_url = check_config.feishu_webhook_url.clone();
-        let config_yaml_path = check_config.config_yaml_path.clone();
-        let proxy_name = check_config.proxy_name_to_update.clone();
-        let svn_username = check_config.svn_username.clone();
-        let svn_password = check_config.svn_password.clone();
-        tokio::spawn(async move {
-            match get_interface_address(&name_async) {
-                Ok(ip_address) => {
-                    let message = format!("✅ [VPN连接成功] IP地址: {}", ip_address);
-                    log::info!("{}", message);
-                    
-                    // 更新配置文件中的代理server地址
-                    if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
-                        log::warn!("Failed to update config.yaml: {}", e);
-                    } else {
-                        log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
-                    }
-                    
-                    if let Err(e) = send_feishu_message(&feishu_url, &message).await {
-                        log::warn!("Failed to send feishu message: {}", e);
-                    }
-                },
-                Err(e) => {
-                    // 将错误转换为字符串，确保Send安全
-                    let err_str = format!("{}", e);
-                    log::warn!("Failed to get interface address: {}", err_str);
-                    let message = format!("✅ [VPN连接成功] 未能获取IP地址: {}", err_str);
-                    log::warn!("{}", message);
-                    if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
-                        // 将错误转换为字符串，确保Send安全
-                        let msg_err_str = format!("{}", msg_err);
-                        log::warn!("Failed to send feishu message: {}", msg_err_str);
-                    }
-                }
-            }
-        });
-
-        #[cfg(target_os = "macos")]
-        let mut dns_manager = DNSManager::new();
-
-        #[cfg(target_os = "macos")]
-        if use_vpn_dns {
-            match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
-                Ok(_) => {}
-                Err(err) => {
-                    log::warn!("failed to set dns: {}", err);
-                }
-            }
-        }
-
         let mut exit_code = 0;
-        tokio::select! {
-            // handle signal
-            _ = async {
-                match tokio::signal::ctrl_c().await {
-                    Ok(_) => {},
-                    Err(e) => {
-                        log::warn!("failed to receive signal: {}",e);
+        
+        // 检查是否在内网环境
+        if wg_conf.use_intranet {
+            log::info!("在内网环境，跳过WireGuard启动和配置");
+            
+            // 获取接口地址并发送飞书消息
+            let intranet_ip = wg_conf.address.split('/').next().unwrap_or("unknown");
+            let message = format!("✅ [内网连接成功] 检测到内网环境，IP地址: {}", intranet_ip);
+            log::info!("{}", message);
+            
+            // 更新配置文件中的代理server地址
+            if let Err(e) = yaml::update_config_yaml(&check_config.config_yaml_path, intranet_ip, &check_config.proxy_name_to_update, &check_config.svn_username, &check_config.svn_password) {
+                log::warn!("Failed to update config.yaml: {}", e);
+            } else {
+                log::info!("Successfully updated {} server address to {}", check_config.proxy_name_to_update, intranet_ip);
+            }
+            
+            if let Err(e) = send_feishu_message(&check_config.feishu_webhook_url, &message).await {
+                log::warn!("Failed to send feishu message: {}", e);
+            }
+            
+            // 仅运行保活逻辑
+            tokio::select! {
+                // handle signal
+                _ = async {
+                    match tokio::signal::ctrl_c().await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            log::warn!("failed to receive signal: {}",e);
+                        },
+                    }
+                    log::info!("ctrl+c received");
+                    should_exit = true;
+                } => {},
+
+                // keep alive
+                _ = c.keep_alive_vpn(&wg_conf, 10) => {
+                    exit_code = ETIMEDOUT;
+                    log::warn!("VPN keep alive failed, try to reconnect...");
+                },
+            }
+        } else {
+            // 非内网环境，执行正常的VPN启动和配置逻辑
+            log::info!("start wg-corplink for {}", &name_clone);
+            let protocol = wg_conf.protocol;
+            wg::start_wg_go(&name_clone, protocol, with_wg_log)?;
+            let mut uapi = wg::UAPIClient { name: name_clone.clone() };
+            uapi.config_wg(&wg_conf).await?;
+            
+            // 获取接口地址并发送飞书消息
+            let name_async = name_clone.clone();
+            let feishu_url = check_config.feishu_webhook_url.clone();
+            let config_yaml_path = check_config.config_yaml_path.clone();
+            let proxy_name = check_config.proxy_name_to_update.clone();
+            let svn_username = check_config.svn_username.clone();
+            let svn_password = check_config.svn_password.clone();
+            tokio::spawn(async move {
+                match get_interface_address(&name_async) {
+                    Ok(ip_address) => {
+                        let message = format!("✅ [VPN连接成功] IP地址: {}", ip_address);
+                        log::info!("{}", message);
+                        
+                        // 更新配置文件中的代理server地址
+                        if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
+                            log::warn!("Failed to update config.yaml: {}", e);
+                        } else {
+                            log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
+                        }
+                        
+                        if let Err(e) = send_feishu_message(&feishu_url, &message).await {
+                            log::warn!("Failed to send feishu message: {}", e);
+                        }
                     },
+                    Err(e) => {
+                        // 将错误转换为字符串，确保Send安全
+                        let err_str = format!("{}", e);
+                        log::warn!("Failed to get interface address: {}", err_str);
+                        let message = format!("✅ [VPN连接成功] 未能获取IP地址: {}", err_str);
+                        log::warn!("{}", message);
+                        if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
+                            // 将错误转换为字符串，确保Send安全
+                            let msg_err_str = format!("{}", msg_err);
+                            log::warn!("Failed to send feishu message: {}", msg_err_str);
+                        }
+                    }
                 }
-                log::info!("ctrl+c received");
-                should_exit = true;
-            } => {},
+            });
 
-            // keep alive
-            _ = c.keep_alive_vpn(&wg_conf, 60) => {
-                exit_code = ETIMEDOUT;
-                log::warn!("VPN keep alive failed, try to reconnect...");
-            },
+            #[cfg(target_os = "macos")]
+            let mut dns_manager = DNSManager::new();
 
-            // check wg handshake and exit if timeout
-            _ = async {
-                uapi.check_wg_connection().await;
-                log::warn!("last handshake timeout, try to reconnect...");
-            } => {
-                exit_code = ETIMEDOUT;
-            },
-        }
+            #[cfg(target_os = "macos")]
+            if use_vpn_dns {
+                match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!("failed to set dns: {}", err);
+                    }
+                }
+            }
 
-        // shutdown
-        log::info!("disconnecting vpn...");
-        match c.disconnect_vpn(&wg_conf).await {
-            Ok(_) => {}
-            Err(e) => log::warn!("failed to disconnect vpn: {}", e),
-        };
+            tokio::select! {
+                // handle signal
+                _ = async {
+                    match tokio::signal::ctrl_c().await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            log::warn!("failed to receive signal: {}",e);
+                        },
+                    }
+                    log::info!("ctrl+c received");
+                    should_exit = true;
+                } => {},
 
-        wg::stop_wg_go();
+                // keep alive
+                _ = c.keep_alive_vpn(&wg_conf, 60) => {
+                    exit_code = ETIMEDOUT;
+                    log::warn!("VPN keep alive failed, try to reconnect...");
+                },
 
-        #[cfg(target_os = "macos")]
-        if use_vpn_dns {
-            match dns_manager.restore_dns() {
+                // check wg handshake and exit if timeout
+                _ = async {
+                    uapi.check_wg_connection().await;
+                    log::warn!("last handshake timeout, try to reconnect...");
+                } => {
+                    exit_code = ETIMEDOUT;
+                },
+            }
+
+            // shutdown
+            log::info!("disconnecting vpn...");
+            match c.disconnect_vpn(&wg_conf).await {
                 Ok(_) => {}
-                Err(err) => {
-                    log::warn!("failed to delete dns: {}", err);
+                Err(e) => log::warn!("failed to disconnect vpn: {}", e),
+            };
+
+            wg::stop_wg_go();
+
+            #[cfg(target_os = "macos")]
+            if use_vpn_dns {
+                match dns_manager.restore_dns() {
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!("failed to delete dns: {}", err);
+                    }
                 }
             }
         }

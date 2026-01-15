@@ -52,6 +52,7 @@ pub struct Config {
     pub log_directory: Option<String>,
     pub check_config_path: Option<String>,
     pub log_level: Option<String>,
+    pub intranet_domain: Option<String>,
 }
 
 impl fmt::Display for Config {
@@ -142,6 +143,10 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+    
+    // intranet confs
+    pub use_intranet: bool,
+    pub intranet_domain: Option<String>,
 }
 
 // 检查配置结构体

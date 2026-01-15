@@ -117,13 +117,14 @@ impl UAPIClient {
 
     pub async fn check_wg_connection(&mut self) {
         // default refresh key timeout of wg is 2 min
-        // we set wg connection timeout to 5 min
-        let interval = time::Duration::from_secs(5 * 60);
-        let mut ticker = tokio::time::interval(interval);
-        let mut timeout = false;
+        // we set wg connection timeout to 1 min
+        let interval = time::Duration::from_secs(1 * 60);
+        // 每10秒检查一次握手时间，更快检测连接问题
+        let mut ticker = tokio::time::interval(time::Duration::from_secs(10));
         // consume the first tick
         ticker.tick().await;
-        while !timeout {
+        
+        loop {
             ticker.tick().await;
 
             let name = self.name.as_str();
@@ -141,8 +142,11 @@ impl UAPIClient {
                     continue;
                 }
             };
+            
+            let mut handshake_found = false;
             for line in s.split('\n') {
                 if line.starts_with("last_handshake_time_sec") {
+                    handshake_found = true;
                     let last = match line.trim_end().split('=').next_back() {
                         Some(v) => v,
                         None => {
@@ -153,7 +157,9 @@ impl UAPIClient {
                     match last.parse::<i64>() {
                         Ok(timestamp) => {
                             if timestamp == 0 {
-                                // do nothing because it's invalid
+                                // 握手时间为0，可能是连接刚建立或已断开
+                                log::warn!("last handshake time is 0, connection may be broken");
+                                return; // 立即返回，触发重连
                             } else if let Some(nt) = chrono::DateTime::from_timestamp(timestamp, 0) {
                                 let now = chrono::Utc::now().to_utc();
                                 let t = now - nt;
@@ -170,7 +176,7 @@ impl UAPIClient {
                                                 elapsed,
                                                 interval.as_secs()
                                             );
-                                            timeout = true;
+                                            return; // 握手超时，立即返回，触发重连
                                         }
                                     }
                                 }
@@ -189,6 +195,12 @@ impl UAPIClient {
                     // reach end
                     break;
                 }
+            }
+            
+            // 如果没有找到握手时间，可能是连接已断开
+            if !handshake_found {
+                log::warn!("no handshake time found in uapi response, connection may be broken");
+                return; // 立即返回，触发重连
             }
         }
     }

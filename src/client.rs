@@ -798,6 +798,7 @@ impl Client {
 
     // ping vpn and return latency in ms. Will return -1 on error
     // 保留原方法，供其他地方调用，直接调用ping_single_ip方法
+    #[allow(dead_code)]
     async fn ping_vpn(&mut self, ip: String, api_port: u16) -> i64 {
         self.ping_single_ip(ip, api_port).await
     }
@@ -839,6 +840,48 @@ impl Client {
     }
 
     pub async fn connect_vpn(&mut self) -> Result<WgConf, Error> {
+        // 首先检测是否在内网环境
+        if let Some(_intranet_domain) = &self.conf.intranet_domain {
+            if utils::is_in_intranet(&self.conf.intranet_domain) {
+                log::info!("检测到内网环境，不需要建立VPN连接");
+                
+                // 获取默认路由IP
+                match utils::get_default_route_ip() {
+                    Ok(intranet_ip) => {
+                        log::info!("获取到默认路由IP: {}", intranet_ip);
+                        
+                        // 发送内网IP到飞书
+                        // let check_config = crate::config::read_check_config(self.conf.check_config_path.as_deref());
+                        // let feishu_message = format!("检测到内网环境，当前出口IP: {}", intranet_ip);
+                        // if let Err(e) = utils::send_feishu_message(&check_config.feishu_webhook_url, &feishu_message).await {
+                        //     log::warn!("发送飞书消息失败: {}", e);
+                        // }
+                        
+                        // 返回一个空的WgConf，仅设置内网相关字段
+                        // 因为在内网环境下不需要实际的VPN配置
+                        return Ok(WgConf {
+                            address: format!("{}/24", intranet_ip),
+                            address6: "".to_string(),
+                            peer_address: format!("{}:0", intranet_ip),
+                            mtu: 1420,
+                            public_key: "".to_string(),
+                            private_key: "".to_string(),
+                            peer_key: "".to_string(),
+                            route: Vec::new(),
+                            dns: "8.8.8.8".to_string(),
+                            protocol: 0,
+                            use_intranet: true,
+                            intranet_domain: self.conf.intranet_domain.clone(),
+                        });
+                    },
+                    Err(e) => {
+                        log::warn!("获取默认路由IP失败: {}, 继续执行VPN连接逻辑", e);
+                    }
+                }
+            }
+        }
+        
+        // 非内网环境，执行正常的VPN连接逻辑
         let vpn_info = self.list_vpn().await?;
 
         log::info!("found {} vpn(s)", vpn_info.len());
@@ -899,6 +942,7 @@ impl Client {
             Some(ref vpn) => vpn,
             None => return Err(Error::Error("no vpn available".to_string())),
         };
+        
         let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
         log::info!("try connect to {}, address {}", vpn.name, vpn_addr);
         
@@ -937,35 +981,48 @@ impl Client {
                 // udp
                 _ => 0,
             },
+            use_intranet: false,
+            intranet_domain: self.conf.intranet_domain.clone(),
         };
         Ok(wg_conf)
     }
 
-    pub async fn keep_alive_vpn(&mut self, conf: &WgConf, interval: u64) {
+    pub async fn keep_alive_vpn(&mut self, conf: &WgConf, _interval: u64) {
         let mut consecutive_errors = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+        const KEEP_ALIVE_INTERVAL: u64 = 10; // 所有环境下统一使用10秒保活间隔
         
         loop {
-            match self.report_vpn_status(conf).await {
-                Ok(_) => {
-                    // 成功时重置错误计数器
-                    consecutive_errors = 0;
+            let keep_alive_success = if conf.use_intranet && conf.intranet_domain.is_some() {
+                // 在内网环境，使用ping方式保活
+                if let Some(domain) = &conf.intranet_domain {
+                    log::debug!("使用ping方式保活，目标域名: {}", domain);
+                    utils::ping_domain(domain)
+                } else {
+                    false
                 }
-                Err(err) => {
-                    consecutive_errors += 1;
-                    log::warn!("keep alive error (retry count {}): {}", consecutive_errors, err);
-                    
-                    // 如果连续错误超过5次，则返回
-                    if consecutive_errors > MAX_CONSECUTIVE_ERRORS {
-                        log::error!("Too many consecutive errors, giving up");
-                        return;
-                    }
-                    
-                    // 等待5秒后重试
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+            } else {
+                // 在外网环境，使用原来的report_vpn_status方式
+                self.report_vpn_status(conf).await.is_ok()
+            };
+            
+            if keep_alive_success {
+                // 成功时重置错误计数器
+                consecutive_errors = 0;
+                log::debug!("保活成功");
+            } else {
+                consecutive_errors += 1;
+                log::warn!("保活失败 (连续失败次数 {}): 触发重试", consecutive_errors);
+                
+                // 如果连续错误超过5次，则返回，触发重连
+                if consecutive_errors > MAX_CONSECUTIVE_ERRORS {
+                    log::error!("连续失败次数超过 {}, 触发重连", MAX_CONSECUTIVE_ERRORS);
+                    return;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(interval)).await;
+            
+            // 所有环境下统一使用10秒间隔保活
+            tokio::time::sleep(Duration::from_secs(KEEP_ALIVE_INTERVAL)).await;
         }
     }
 
