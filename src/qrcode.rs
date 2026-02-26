@@ -1,4 +1,4 @@
-use qrcode::{EcLevel, QrCode, Version};
+use qrcode::QrCode;
 use terminal_graphics::Colour;
 use terminal_graphics::Display;
 
@@ -9,7 +9,11 @@ pub struct TerminalQrCode {
 
 impl TerminalQrCode {
     pub fn from_bytes<D: AsRef<[u8]>>(data: D) -> TerminalQrCode {
-        let code = QrCode::with_version(data, Version::Normal(20), EcLevel::L).unwrap();
+        // 使用自动版本选择，而不是固定版本，以适应不同长度的数据
+        let code = QrCode::new(data).unwrap_or_else(|_| {
+            // 如果二维码生成失败，使用一个简短的占位符
+            QrCode::new("QR code generation failed").unwrap()
+        });
         TerminalQrCode { code }
     }
 

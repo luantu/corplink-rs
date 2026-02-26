@@ -743,6 +743,14 @@ impl Client {
         
         // 测试每个IP的延迟
         for ip in ips_to_test {
+            // 检查IP是否在bypass列表中，如果在就跳过
+            if let Some(bypass_list) = &self.conf.vpn_server_ip_bypass {
+                if bypass_list.contains(&ip) {
+                    log::info!("skip IP {} in bypass list", ip);
+                    continue;
+                }
+            }
+            
             let latency = self.ping_single_ip(ip.clone(), vpn.api_port).await;
             
             if latency != -1 {

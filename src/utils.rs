@@ -1,6 +1,6 @@
 use std::io::{self, BufRead};
 use std::process::Command;
-use std::process::exit;
+
 
 use anyhow::{anyhow, Context, Result};
 use base32::Alphabet;
@@ -17,8 +17,7 @@ use sudo;
 #[cfg(windows)]
 use is_elevated;
 
-// 定义常量错误码
-const EPERM: i32 = 1;
+
 
 pub async fn read_line() -> Result<String> {
     io::stdin()
@@ -171,20 +170,22 @@ pub fn is_in_intranet(intranet_domain: &Option<String>) -> bool {
 }
 
 /// 检查用户权限
-pub fn check_privilege() {
+pub fn check_privilege() -> Result<(), ()> {
     #[cfg(unix)]
     match sudo::escalate_if_needed() {
-        Ok(_) => {},
+        Ok(_) => Ok(()),
         Err(_) => {
             log::error!("please run as root");
-            exit(EPERM);
+            Err(())
         }
     }
 
     #[cfg(windows)]
     if !is_elevated::is_elevated() {
         log::error!("please run as administrator");
-        exit(EPERM);
+        Err(())
+    } else {
+        Ok(())
     }
 }
 

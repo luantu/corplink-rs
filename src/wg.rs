@@ -117,10 +117,10 @@ impl UAPIClient {
 
     pub async fn check_wg_connection(&mut self) {
         // default refresh key timeout of wg is 2 min
-        // we set wg connection timeout to 1 min
-        let interval = time::Duration::from_secs(1 * 60);
-        // 每10秒检查一次握手时间，更快检测连接问题
-        let mut ticker = tokio::time::interval(time::Duration::from_secs(10));
+        // we set wg connection timeout to 5 min
+        let interval = time::Duration::from_secs(5 * 60);
+        // 每120秒检查一次握手时间，平衡检测速度和资源消耗
+        let mut ticker = tokio::time::interval(time::Duration::from_secs(120));
         // consume the first tick
         ticker.tick().await;
         

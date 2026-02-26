@@ -125,7 +125,7 @@ use std::process::exit;
 
 use client::Client;
 use config::{Config, WgConf, read_check_config};
-use utils::{check_privilege, get_interface_address, print_version, send_feishu_message};
+use utils::{get_interface_address, print_version, send_feishu_message};
 
 fn print_usage_and_exit(name: &str, conf: &str) {
     println!("usage:\n\t{} {}", name, conf);
@@ -203,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 check_config_path: None,
                 log_level: None,
                 intranet_domain: None,
+                vpn_server_ip_bypass: None,
             })
         }
     }?;
@@ -217,9 +218,42 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Feishu URL  : {}", check_config.feishu_webhook_url);
     log::info!("Config Path : {}", check_config.config_yaml_path);
     log::info!("Proxy Name  : {}", check_config.proxy_name_to_update);
+    
+    // 保存飞书webhook_url到变量，用于异常退出时发送通知
+    let feishu_webhook_url = check_config.feishu_webhook_url.clone();
+    let feishu_webhook_url_clone = feishu_webhook_url.clone();
+    
+    // 设置全局panic钩子，捕获所有未处理的panic并发送飞书通知
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let message = match panic_info.payload().downcast_ref::<&str>() {
+            Some(s) => format!("❌ [VPN应用异常崩溃] 原因: {}", s),
+            None => match panic_info.payload().downcast_ref::<String>() {
+                Some(s) => format!("❌ [VPN应用异常崩溃] 原因: {}", s),
+                None => "❌ [VPN应用异常崩溃] 原因: 未知错误".to_string(),
+            },
+        };
+        
+        log::error!("{}", message);
+        log::error!("panic occurred at {:?}", panic_info.location());
+        
+        // 同步方式发送飞书通知，避免在panic时创建新的运行时
+        // 注意：这里使用block_on可能会在某些环境下失败，但在大多数情况下应该可以工作
+        // 如果失败，我们也不需要处理，因为程序已经在panic中
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() {
+            let _ = rt.block_on(utils::send_feishu_message(&feishu_webhook_url_clone, &message));
+        }
+    }));
 
     print_version();
-    check_privilege();
+    
+    // 检查权限
+    if let Err(_) = utils::check_privilege() {
+        log::error!("permission denied, try to run with sudo or as root");
+        // 权限不足，发送飞书通知
+        let message = "❌ [VPN应用异常退出] 权限不足，请使用sudo或管理员权限运行";
+        let _ = utils::send_feishu_message(&feishu_webhook_url, message).await;
+        exit(EPERM);
+    }
 
     let name = conf.interface_name.clone().unwrap_or_else(|| DEFAULT_INTERFACE_NAME.to_string());
 
@@ -245,6 +279,9 @@ async fn main() -> anyhow::Result<()> {
                     conf.company_name,
                     err
                 );
+                // 获取公司服务器失败，发送飞书通知
+                let message = format!("❌ [VPN应用异常退出] 获取公司服务器失败: {}", err);
+                let _ = utils::send_feishu_message(&feishu_webhook_url, &message).await;
                 exit(EPERM);
             }
         },
@@ -258,8 +295,7 @@ async fn main() -> anyhow::Result<()> {
 const DEFAULT_DEVICE_NAME: &str = "wg-corplink";
 const DEFAULT_INTERFACE_NAME: &str = "wg-corplink";
 
-// 全局重试参数：最长重试时间为5分钟，初始重试间隔为5秒
-const MAX_RETRY_TIME_MINUTES: u64 = 1;
+// 全局重试参数：初始重试间隔为5秒
 const INITIAL_RETRY_INTERVAL_SECONDS: u64 = 5;
 const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
 
@@ -272,16 +308,15 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
         let wg_conf: Option<WgConf>;
         
         // 登录和连接VPN的逻辑 - 添加全局重试机制
-        let start_retry_time = std::time::Instant::now();
         let mut retry_interval = INITIAL_RETRY_INTERVAL_SECONDS;
         let mut connection_attempts = 0;
         
         loop {
-            // 检查是否达到最大重试时间
-            if start_retry_time.elapsed().as_secs() > MAX_RETRY_TIME_MINUTES * 60 {
-                log::error!("Maximum retry time ({} minutes) reached. Exiting...", MAX_RETRY_TIME_MINUTES);
-                exit(ETIMEDOUT);
-            }
+            // 移除最大重试时间限制，改为一直重试
+            // if start_retry_time.elapsed().as_secs() > MAX_RETRY_TIME_MINUTES * 60 {
+            //     log::error!("Maximum retry time ({} minutes) reached. Exiting...", MAX_RETRY_TIME_MINUTES);
+            //     exit(ETIMEDOUT);
+            // }
             
             connection_attempts += 1;
             
@@ -476,12 +511,18 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
 
             // shutdown
             log::info!("disconnecting vpn...");
+            // 先停止WireGuard服务，再断开VPN连接
+            // 这样可以避免在断开连接时产生网络连接已关闭的错误
+            wg::stop_wg_go();
+            
+            // 短暂延迟，确保WireGuard服务已经完全停止
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            
+            // 断开VPN连接
             match c.disconnect_vpn(&wg_conf).await {
                 Ok(_) => {}
                 Err(e) => log::warn!("failed to disconnect vpn: {}", e),
             };
-
-            wg::stop_wg_go();
 
             #[cfg(target_os = "macos")]
             if use_vpn_dns {

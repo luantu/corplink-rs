@@ -15,5 +15,7 @@
   "vpn_server_name": "",
   "vpn_select_strategy": "latency",
   "use_vpn_dns": null,
-  "log_directory": ""
+  "log_directory": "",
+  "intranet_domain": "",
+  "vpn_server_ip_bypass": null
 }
