@@ -128,9 +128,20 @@ impl Client {
         log::info!("cookie file is: {}", cookie_file.to_str().unwrap());
 
         let mut cookie_store = {
-            let file = fs::File::open(cookie_file).map(io::BufReader::new);
-            match file {
-                Ok(file) => CookieStore::load_json_all(file).unwrap(),
+            let file_result = fs::File::open(&cookie_file).map(io::BufReader::new);
+            match file_result {
+                Ok(file) => {
+                    // 尝试使用serde_json::from_reader直接反序列化整个CookieStore对象
+                    match serde_json::from_reader(file) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            // 如果失败，尝试使用旧的load_json_all方法
+                            log::warn!("Failed to deserialize cookie store, trying load_json_all: {}", e);
+                            let file = fs::File::open(&cookie_file).map(io::BufReader::new).unwrap();
+                            CookieStore::load_json_all(file).unwrap()
+                        }
+                    }
+                },
                 Err(_) => CookieStore::default(),
             }
         };
@@ -208,20 +219,20 @@ impl Client {
                 COOKIE_FILE_SUFFIX
             ));
             
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(false)
-                .open(&cookie_file)
-                .map(io::BufWriter::new)
+            // 创建一个临时缓冲区来写入cookie数据
+            let mut buffer = Vec::new();
             {
                 let c = self.cookie.lock().unwrap();
-                if let Err(e) = c.save_json(&mut file) {
-                    log::error!("Failed to save cookie: {}", e);
+                // 使用serde_json::to_writer直接序列化整个CookieStore对象，生成一个合法的JSON数组
+                if let Err(e) = serde_json::to_writer(&mut buffer, &*c) {
+                    log::error!("Failed to serialize cookie store: {}", e);
+                    return;
                 }
-            } else {
-                log::error!("Failed to open cookie file for writing: {}", 
-                    cookie_file.to_str().unwrap_or("unknown path"));
+            }
+            
+            // 一次性写入整个文件，确保生成的JSON格式正确
+            if let Err(e) = fs::write(&cookie_file, buffer) {
+                log::error!("Failed to write cookie file: {}", e);
             }
         } else {
             log::error!("No configuration file path available to determine cookie file location");
