@@ -1,4 +1,5 @@
 use qrcode::QrCode;
+use std::io::Write;
 use terminal_graphics::Colour;
 use terminal_graphics::Display;
 
@@ -57,5 +58,11 @@ impl TerminalQrCode {
             println!();
         }
         display.print();
+        
+        // 强制刷新输出缓冲区，确保二维码完全打印
+        std::io::stdout().flush().unwrap();
+        
+        // 添加一个小延迟，确保二维码完全显示
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
