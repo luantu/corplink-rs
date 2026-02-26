@@ -123,6 +123,9 @@ use dns::DNSManager;
 use std::env;
 use std::process::exit;
 
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+
 use client::Client;
 use config::{Config, WgConf, read_check_config};
 use utils::{get_interface_address, print_version, send_feishu_message};
@@ -405,13 +408,31 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
             tokio::select! {
                 // handle signal
                 _ = async {
-                    match tokio::signal::ctrl_c().await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            log::warn!("failed to receive signal: {}",e);
-                        },
+                    // 处理SIGINT和SIGTERM信号
+                    #[cfg(unix)]
+                    {
+                        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+                        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+                        
+                        tokio::select! {
+                            _ = sigint.recv() => {
+                                log::info!("SIGINT received");
+                            },
+                            _ = sigterm.recv() => {
+                                log::info!("SIGTERM received");
+                            },
+                        }
                     }
-                    log::info!("ctrl+c received");
+                    #[cfg(not(unix))]
+                    {
+                        match tokio::signal::ctrl_c().await {
+                            Ok(_) => {},
+                            Err(e) => {
+                                log::warn!("failed to receive signal: {}",e);
+                            },
+                        }
+                        log::info!("ctrl+c received");
+                    }
                     should_exit = true;
                 } => {},
 
@@ -484,13 +505,31 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
             tokio::select! {
                 // handle signal
                 _ = async {
-                    match tokio::signal::ctrl_c().await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            log::warn!("failed to receive signal: {}",e);
-                        },
+                    // 处理SIGINT和SIGTERM信号
+                    #[cfg(unix)]
+                    {
+                        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+                        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+                        
+                        tokio::select! {
+                            _ = sigint.recv() => {
+                                log::info!("SIGINT received");
+                            },
+                            _ = sigterm.recv() => {
+                                log::info!("SIGTERM received");
+                            },
+                        }
                     }
-                    log::info!("ctrl+c received");
+                    #[cfg(not(unix))]
+                    {
+                        match tokio::signal::ctrl_c().await {
+                            Ok(_) => {},
+                            Err(e) => {
+                                log::warn!("failed to receive signal: {}",e);
+                            },
+                        }
+                        log::info!("ctrl+c received");
+                    }
                     should_exit = true;
                 } => {},
 
