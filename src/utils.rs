@@ -195,3 +195,20 @@ pub fn print_version() {
     let pkg_version = env!("CARGO_PKG_VERSION");
     log::info!("running {}@{}", pkg_name, pkg_version);
 }
+
+/// 解析域名的DNS，返回是否能正常解析
+pub fn resolve_dns(domain: &str) -> bool {
+    // 使用dig命令解析域名
+    let output = Command::new("dig")
+        .args(["+short", domain])
+        .output();
+    
+    match output {
+        Ok(output) => {
+            // 检查输出是否为空
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            !output_str.is_empty() && output.status.success()
+        },
+        Err(_) => false
+    }
+}

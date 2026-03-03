@@ -183,32 +183,33 @@ async fn main() -> anyhow::Result<()> {
     }) {
         Ok(future) => future.await,
         Err(_) => {
-            eprintln!("[ERROR] Failed to load config file, using default configuration");
-            Ok(Config {
-                company_name: String::from("default"),
-                username: String::from("user"),
-                password: None,
-                platform: None,
-                code: None,
-                device_name: Some(DEFAULT_DEVICE_NAME.to_string()),
-                device_id: None,
-                public_key: None,
-                private_key: None,
-                server: None,
-                interface_name: Some(DEFAULT_INTERFACE_NAME.to_string()),
-                debug_wg: None,
-                conf_file: Some(conf_file_clone),
-                state: None,
-                vpn_server_name: None,
-                vpn_select_strategy: None,
-                use_vpn_dns: None,
-                log_directory: None,
-                check_config_path: None,
-                log_level: None,
-                intranet_domain: None,
-                vpn_server_ip_bypass: None,
-            })
-        }
+                eprintln!("[ERROR] Failed to load config file, using default configuration");
+                Ok(Config {
+                    company_name: String::from("default"),
+                    username: String::from("user"),
+                    password: None,
+                    platform: None,
+                    code: None,
+                    device_name: Some(DEFAULT_DEVICE_NAME.to_string()),
+                    device_id: None,
+                    public_key: None,
+                    private_key: None,
+                    server: None,
+                    interface_name: Some(DEFAULT_INTERFACE_NAME.to_string()),
+                    debug_wg: None,
+                    conf_file: Some(conf_file_clone),
+                    state: None,
+                    vpn_server_name: None,
+                    vpn_select_strategy: None,
+                    use_vpn_dns: None,
+                    log_directory: None,
+                    check_config_path: None,
+                    log_level: None,
+                    intranet_domain: None,
+                    vpn_server_ip_bypass: None,
+                    origin_dns: None,
+                })
+            }
     }?;
     
     // 初始化日志系统，使用配置文件中的log_directory和log_level设置
@@ -313,6 +314,7 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
         // 登录和连接VPN的逻辑 - 添加全局重试机制
         let mut retry_interval = INITIAL_RETRY_INTERVAL_SECONDS;
         let mut connection_attempts = 0;
+        let mut dns_restored = false;
         
         loop {
             // 移除最大重试时间限制，改为一直重试
@@ -352,6 +354,71 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
                     } else {
                         // 处理连接失败，进行重试
                         log::warn!("Connection failed: {}", e);
+                        
+                        // 检查是否是连接超时或DNS解析错误
+                        if e.to_string().contains("operation timed out") || e.to_string().contains("dns error") {
+                            // 尝试解析服务器域名的DNS
+                            if let Some(server) = &c.conf.server {
+                                // 提取域名部分
+                                let domain = server
+                                    .trim_start_matches("https://")
+                                    .trim_start_matches("http://")
+                                    .split_once(':')
+                                    .map(|(d, _)| d)
+                                    .unwrap_or(server);
+                                
+                                log::info!("Checking DNS resolution for domain: {}", domain);
+                                if !utils::resolve_dns(domain) {
+                                    log::warn!("DNS resolution failed for domain: {}", domain);
+                                    
+                                    // 在macOS上处理DNS设置
+                                    #[cfg(target_os = "macos")]
+                                    if use_vpn_dns {
+                                        let mut dns_manager = DNSManager::new();
+                                        if !dns_restored {
+                                            // 第一次尝试恢复默认DNS
+                                            log::info!("Attempting to restore default DNS settings");
+                                            if let Err(err) = dns_manager.restore_dns() {
+                                                log::warn!("Failed to restore default DNS: {}", err);
+                                            } else {
+                                                log::info!("Successfully restored default DNS settings");
+                                                dns_restored = true;
+                                                
+                                                // 恢复默认DNS后立即再次尝试解析域名
+                                                log::info!("Checking DNS resolution again after restoring default DNS");
+                                                if !utils::resolve_dns(domain) {
+                                                    log::warn!("DNS resolution still failed after restoring default DNS");
+                                                    // 如果仍然失败，立即尝试使用配置的origin_dns
+                                                    if let Some(origin_dns) = &c.conf.origin_dns {
+                                                        if !origin_dns.is_empty() {
+                                                            log::info!("Attempting to use origin DNS settings: {:?}", origin_dns);
+                                                            if let Err(err) = dns_manager.set_dns(origin_dns.iter().map(|s| s.as_str()).collect(), vec![]) {
+                                                                log::warn!("Failed to set origin DNS: {}", err);
+                                                            } else {
+                                                                log::info!("Successfully set origin DNS settings");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // 已经尝试过恢复默认DNS，直接尝试使用配置的origin_dns
+                                            if let Some(origin_dns) = &c.conf.origin_dns {
+                                                if !origin_dns.is_empty() {
+                                                    log::info!("Attempting to use origin DNS settings: {:?}", origin_dns);
+                                                    if let Err(err) = dns_manager.set_dns(origin_dns.iter().map(|s| s.as_str()).collect(), vec![]) {
+                                                        log::warn!("Failed to set origin DNS: {}", err);
+                                                    } else {
+                                                        log::info!("Successfully set origin DNS settings");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
                         log::info!("Waiting {} seconds before retrying... (attempt {})", 
                                 retry_interval, connection_attempts);
                         
@@ -359,7 +426,7 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
                         let feishu_url = check_config.feishu_webhook_url.clone();
                         let retry_msg = format!("⚠️ [VPN连接失败] 将在 {} 秒后重试 (第 {} 次尝试)", 
                                            retry_interval, connection_attempts);
-                        log::info!("{}\n{}", retry_msg, e);
+                        log::info!("{}", retry_msg);
                         
                         if let Err(msg_err) = send_feishu_message(&feishu_url, &retry_msg).await {
                             log::warn!("Failed to send feishu message: {}", msg_err);

@@ -54,6 +54,7 @@ pub struct Config {
     pub log_level: Option<String>,
     pub intranet_domain: Option<String>,
     pub vpn_server_ip_bypass: Option<Vec<String>>,
+    pub origin_dns: Option<Vec<String>>,
 }
 
 impl fmt::Display for Config {

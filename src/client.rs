@@ -71,7 +71,7 @@ impl From<reqwest::Error> for Error {
 
 #[derive(Clone)]
 pub struct Client {
-    conf: Config,
+    pub conf: Config,
     cookie: Arc<CookieStoreMutex>,
     c: reqwest::Client,
     api_url: ApiUrl,
