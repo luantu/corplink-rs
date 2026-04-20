@@ -129,10 +129,68 @@ use tokio::signal::unix::{signal, SignalKind};
 use client::Client;
 use config::{Config, WgConf, read_check_config};
 use utils::{get_interface_address, print_version, send_feishu_message};
+use serde_json::Value;
 
 fn print_usage_and_exit(name: &str, conf: &str) {
     println!("usage:\n\t{} {}", name, conf);
     exit(1);
+}
+
+/// 检查cookie的过期时间，并在到期前一天通过飞书发送通知
+async fn check_cookie_expiry(conf: &Config, feishu_webhook_url: &str) {
+    // 构建cookie文件路径
+    if let Some(conf_file) = &conf.conf_file {
+        let dir = match std::path::Path::new(conf_file).parent() {
+            Some(dir) => dir,
+            None => std::path::Path::new("."),
+        };
+        let cookie_file = dir.join(format!(
+            "{}_{}",
+            conf.interface_name.clone().unwrap_or_else(|| "corplink".to_string()),
+            "cookies.json"
+        ));
+        
+        // 读取cookie文件
+        if let Ok(cookie_content) = std::fs::read_to_string(&cookie_file) {
+            // 解析JSON内容
+            if let Ok(cookies) = serde_json::from_str::<Value>(&cookie_content) {
+                if let Some(cookies_array) = cookies.as_array() {
+                    let now = chrono::Utc::now();
+                    let one_day = chrono::Duration::days(1);
+                    
+                    for cookie in cookies_array {
+                        if let Some(expires) = cookie.get("expires").and_then(|e| e.get("AtUtc")) {
+                            if let Some(expires_str) = expires.as_str() {
+                                if let Ok(expires_time) = chrono::DateTime::parse_from_rfc3339(expires_str) {
+                                    let expires_utc = expires_time.with_timezone(&chrono::Utc);
+                                    let time_left = expires_utc - now;
+                                    
+                                    // 检查是否在到期前一天
+                                    if time_left <= one_day && time_left > chrono::Duration::zero() {
+                                        let cookie_name = cookie.get("raw_cookie")
+                                            .and_then(|rc| rc.as_str())
+                                            .unwrap_or("unknown");
+                                        let days_left = time_left.num_days();
+                                        let hours_left = time_left.num_hours() % 24;
+                                        
+                                        let message = format!(
+                                            "⚠️ [Cookie即将到期]\nCookie将在 {} 天 {} 小时后到期\nCookie: {}",
+                                            days_left, hours_left, cookie_name
+                                        );
+                                        
+                                        log::info!("{}", message);
+                                        if let Err(err) = send_feishu_message(feishu_webhook_url, &message).await {
+                                            log::warn!("Failed to send cookie expiry notification: {}", err);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn parse_arg() -> String {
@@ -225,7 +283,19 @@ async fn main() -> anyhow::Result<()> {
     
     // 保存飞书webhook_url到变量，用于异常退出时发送通知
     let feishu_webhook_url = check_config.feishu_webhook_url.clone();
+    let feishu_webhook_url_clone_panic = feishu_webhook_url.clone();
+    
+    // 启动一个异步任务，每天检查一次cookie的过期时间
+    let conf_clone = conf.clone();
     let feishu_webhook_url_clone = feishu_webhook_url.clone();
+    tokio::spawn(async move {
+        loop {
+            // 检查cookie的过期时间
+            check_cookie_expiry(&conf_clone, &feishu_webhook_url_clone).await;
+            // 等待24小时后再次检查
+            tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
     
     // 设置全局panic钩子，捕获所有未处理的panic并发送飞书通知
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -244,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
         // 注意：这里使用block_on可能会在某些环境下失败，但在大多数情况下应该可以工作
         // 如果失败，我们也不需要处理，因为程序已经在panic中
         if let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() {
-            let _ = rt.block_on(utils::send_feishu_message(&feishu_webhook_url_clone, &message));
+            let _ = rt.block_on(utils::send_feishu_message(&feishu_webhook_url_clone_panic, &message));
         }
     }));
 
