@@ -161,9 +161,16 @@ pub fn get_default_route_ip() -> Result<String, String> {
 }
 
 /// 检测是否在内网环境，返回是否在内网
+/// 简化版本：只需ping通域名即可认为在内网环境
 pub fn is_in_intranet(intranet_domain: &Option<String>) -> bool {
     if let Some(domain) = intranet_domain {
-        ping_domain(domain)
+        if ping_domain(domain) {
+            log::info!("域名 {} 可ping通，检测到内网环境", domain);
+            return true;
+        } else {
+            log::info!("域名 {} 不可ping通，非内网环境或网络不可达", domain);
+            return false;
+        }
     } else {
         false
     }

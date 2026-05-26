@@ -45,8 +45,46 @@ pub fn stop_wg_go() {
     stop_wg();
 }
 
+pub fn set_performance_config(
+    mtu: u32,
+    keepalive_interval: u32,
+    tcp_buffer_size: u32,
+    socket_buffer_size: u32,
+    batch_size: u32,
+    queue_size: u32,
+) {
+    unsafe {
+        libwg::setPerformanceConfig(mtu, keepalive_interval, tcp_buffer_size, socket_buffer_size, batch_size, queue_size);
+    }
+    log::info!(
+        "Performance config set: MTU={}, Keepalive={}s, TCPBuf={}KB, SocketBuf={}KB, BatchSize={}, QueueSize={}",
+        mtu, keepalive_interval, tcp_buffer_size / 1024, socket_buffer_size / 1024, batch_size, queue_size
+    );
+}
+
+#[allow(dead_code)]
+pub fn get_performance_config() -> (u32, u32, u32, u32, u32, u32) {
+    unsafe {
+        let result = libwg::getPerformanceConfig();
+        (result.r0, result.r1, result.r2, result.r3, result.r4, result.r5)
+    }
+}
+
+#[allow(dead_code)]
+pub fn get_performance_metrics() -> (u64, u64, u64, u64) {
+    unsafe {
+        let result = libwg::getPerformanceMetrics();
+        (result.r0, result.r1, result.r2, result.r3)
+    }
+}
+
 pub fn start_wg_go(name: &str, protocol: i32, with_log: bool) -> Result<()> {
-    log::info!("start wg-corplink");
+    let protocol_str = match protocol {
+        0 => "UDP",
+        1 => "TCP",
+        _ => "Unknown",
+    };
+    log::info!("start wg-corplink with protocol: {}", protocol_str);
     let mut log_level = libwg::LogLevelError;
     if with_log {
         log_level = libwg::LogLevelVerbose;
@@ -55,6 +93,7 @@ pub fn start_wg_go(name: &str, protocol: i32, with_log: bool) -> Result<()> {
     if !matches!(ret, 0) {
         return Err(anyhow!("start_wg returned non-zero code: {ret}"));
     }
+    log::info!("WireGuard started successfully with {} protocol", protocol_str);
     Ok(())
 }
 
@@ -63,10 +102,8 @@ pub struct UAPIClient {
 }
 
 impl UAPIClient {
-    pub async fn config_wg(&mut self, conf: &config::WgConf) -> Result<()> {
+    pub async fn config_wg(&mut self, conf: &config::WgConf, perf_conf: Option<&config::PerformanceConfig>) -> Result<()> {
         let mut buff = String::from("set=1\n");
-        // standard wg-go uapi operations
-        // see https://www.wireguard.com/xplatform/#configuration-protocol
         let private_key = utils::b64_decode_to_hex(&conf.private_key)
             .context("failed to decode private key")?;
         let public_key = utils::b64_decode_to_hex(&conf.peer_key)
@@ -76,7 +113,12 @@ impl UAPIClient {
         buff.push_str(format!("public_key={public_key}\n").as_str());
         buff.push_str("replace_allowed_ips=true\n".to_string().as_str());
         buff.push_str(format!("endpoint={}\n", conf.peer_address).as_str());
-        buff.push_str("persistent_keepalive_interval=10\n".to_string().as_str());
+        
+        let keepalive_interval = perf_conf
+            .and_then(|p| p.keepalive_interval)
+            .unwrap_or(10);
+        buff.push_str(format!("persistent_keepalive_interval={}\n", keepalive_interval).as_str());
+        
         for route in &conf.route {
             if route.contains("/") {
                 buff.push_str(format!("allowed_ip={route}\n").as_str());
@@ -85,10 +127,11 @@ impl UAPIClient {
             }
         }
 
-        // wg-corplink uapi operations
         let addr = &conf.address;
         let addr6 = &conf.address6;
-        let mtu = conf.mtu;
+        let mtu = perf_conf
+            .and_then(|p| p.mtu)
+            .unwrap_or(conf.mtu);
         buff.push_str(format!("address={addr}\n").as_str());
         if !addr6.is_empty() {
             buff.push_str(format!("address={addr6}\n").as_str());
@@ -103,7 +146,14 @@ impl UAPIClient {
                 buff.push_str(format!("route={route}/{prefix_len}\n").as_str());
             }
         }
-        // end operation
+
+        if let Some(perf) = perf_conf {
+            let tcp_buf = perf.tcp_buffer_size.unwrap_or(256 * 1024);
+            let socket_buf = perf.socket_buffer_size.unwrap_or(256 * 1024);
+            let batch = perf.batch_size.unwrap_or(256);
+            let queue = perf.queue_size.unwrap_or(8192);
+            set_performance_config(mtu, keepalive_interval, tcp_buf, socket_buf, batch, queue);
+        }
 
         buff.push('\n');
         log::info!("send config to uapi");

@@ -2,6 +2,7 @@ mod api;
 mod client;
 mod config;
 mod dns;
+mod performance;
 mod qrcode;
 mod resp;
 mod state;
@@ -266,6 +267,8 @@ async fn main() -> anyhow::Result<()> {
                     intranet_domain: None,
                     vpn_server_ip_bypass: None,
                     origin_dns: None,
+                    protocol_mode: None,
+                    performance: None,
                 })
             }
     }?;
@@ -585,7 +588,8 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
             let protocol = wg_conf.protocol;
             wg::start_wg_go(&name_clone, protocol, with_wg_log)?;
             let mut uapi = wg::UAPIClient { name: name_clone.clone() };
-            uapi.config_wg(&wg_conf).await?;
+            let perf_conf = c.conf.performance.as_ref();
+            uapi.config_wg(&wg_conf, perf_conf).await?;
             
             // 获取接口地址并发送飞书消息
             let name_async = name_clone.clone();

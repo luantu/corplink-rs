@@ -29,7 +29,7 @@ use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
-const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 10; en)";
+const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 16; en)";
 
 #[derive(Debug)]
 pub enum Error {
@@ -933,9 +933,16 @@ impl Client {
                     2 => "udp",
                     _ => "unknown protocol",
                 };
+                log::debug!("VPN server {} protocol mode: {}, value: {}", vpn.name, mode, vpn.protocol_mode);
                 match mode {
-                    "udp" => true,
-                    "tcp" => true,
+                    "udp" => {
+                        log::info!("Server {} supports UDP mode", vpn.name);
+                        true
+                    },
+                    "tcp" => {
+                        log::info!("Server {} only supports TCP mode", vpn.name);
+                        true
+                    },
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
@@ -983,6 +990,36 @@ impl Client {
             .unwrap_or("".into());
         let route = [wg_info.setting.vpn_route_split, wg_info.setting.v6_route_split.unwrap_or_default()].concat();
 
+        // 确定协议模式
+        let protocol = if let Some(forced_mode) = self.conf.protocol_mode {
+            // 使用配置文件中强制指定的协议模式
+            let mode_str = match forced_mode {
+                0 => "UDP",
+                1 => "TCP",
+                _ => "Unknown",
+            };
+            log::info!("Forcing protocol mode: {} ({}), ignoring server value: {}", mode_str, forced_mode, vpn.protocol_mode);
+            forced_mode
+        } else {
+            // 使用服务器返回的协议模式
+            match vpn.protocol_mode {
+                // tcp
+                1 => {
+                    log::info!("Using TCP mode for server {}", vpn.name);
+                    1
+                },
+                // udp
+                2 => {
+                    log::info!("Using UDP mode for server {}", vpn.name);
+                    0
+                },
+                _ => {
+                    log::warn!("Unknown protocol mode {} for server {}, defaulting to UDP", vpn.protocol_mode, vpn.name);
+                    0
+                },
+            }
+        };
+        
         // corplink config
         let wg_conf = WgConf {
             address,
@@ -994,15 +1031,12 @@ impl Client {
             peer_key,
             route,
             dns,
-            protocol: match vpn.protocol_mode {
-                // tcp
-                1 => 1,
-                // udp
-                _ => 0,
-            },
+            protocol,
             use_intranet: false,
             intranet_domain: self.conf.intranet_domain.clone(),
         };
+        
+        log::info!("Created WgConf with protocol mode: {} (0=UDP, 1=TCP)", protocol);
         Ok(wg_conf)
     }
 

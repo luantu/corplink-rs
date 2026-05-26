@@ -55,6 +55,20 @@ pub struct Config {
     pub intranet_domain: Option<String>,
     pub vpn_server_ip_bypass: Option<Vec<String>>,
     pub origin_dns: Option<Vec<String>>,
+    pub protocol_mode: Option<i32>,
+    pub performance: Option<PerformanceConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PerformanceConfig {
+    pub mtu: Option<u32>,
+    pub keepalive_interval: Option<u32>,
+    pub rekey_after_time: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub queue_size: Option<u32>,
+    pub buffer_size: Option<u32>,
+    pub socket_buffer_size: Option<u32>,
+    pub tcp_buffer_size: Option<u32>,
 }
 
 impl fmt::Display for Config {
