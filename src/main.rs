@@ -137,6 +137,11 @@ fn print_usage_and_exit(name: &str, conf: &str) {
     exit(1);
 }
 
+/// 生成账号信息前缀，用于飞书通知中标识账号
+fn account_info(conf: &Config) -> String {
+    format!("账号: {}\n", conf.username)
+}
+
 /// 检查cookie的过期时间，并在到期前一天通过飞书发送通知
 async fn check_cookie_expiry(conf: &Config, feishu_webhook_url: &str) {
     // 构建cookie文件路径
@@ -175,7 +180,8 @@ async fn check_cookie_expiry(conf: &Config, feishu_webhook_url: &str) {
                                         let hours_left = time_left.num_hours() % 24;
                                         
                                         let message = format!(
-                                            "⚠️ [Cookie即将到期]\nCookie将在 {} 天 {} 小时后到期\nCookie: {}",
+                                            "[Cookie即将到期]\n{}Cookie将在 {} 天 {} 小时后到期\nCookie: {}",
+                                            account_info(conf),
                                             days_left, hours_left, cookie_name
                                         );
                                         
@@ -278,15 +284,25 @@ async fn main() -> anyhow::Result<()> {
     let _logger = initialize_logger(conf.log_directory.as_deref(), conf.log_level.as_deref());
     
     log::info!("CorpLink start...");
-    // 读取check_config.json配置，使用Config中定义的路径
+    // 读取check_config.json配置，使用Config中定义的路径。
+    // 文件不存在时返回 None，跳过所有飞书通知/yaml更新操作。
     let check_config = read_check_config(conf.check_config_path.as_deref());
-    log::info!("Feishu URL  : {}", check_config.feishu_webhook_url);
-    log::info!("Config Path : {}", check_config.config_yaml_path);
-    log::info!("Proxy Name  : {}", check_config.proxy_name_to_update);
+    if let Some(cc) = &check_config {
+        log::info!("Feishu URL  : {}", cc.feishu_webhook_url);
+        log::info!("Config Path : {}", cc.config_yaml_path);
+        log::info!("Proxy Name  : {}", cc.proxy_name_to_update);
+    } else {
+        log::info!("check_config.json not found, notification/yaml operations are disabled");
+    }
     
     // 保存飞书webhook_url到变量，用于异常退出时发送通知
-    let feishu_webhook_url = check_config.feishu_webhook_url.clone();
+    let feishu_webhook_url = check_config.as_ref().map(|c| c.feishu_webhook_url.clone()).unwrap_or_default();
     let feishu_webhook_url_clone_panic = feishu_webhook_url.clone();
+
+    // 账号信息前缀，用于所有飞书通知
+    let account_str = account_info(&conf);
+    let account_str_clone_panic = account_str.clone();
+    let account_str_clone = account_str.clone();
     
     // 启动一个异步任务，每天检查一次cookie的过期时间
     let conf_clone = conf.clone();
@@ -294,7 +310,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             // 检查cookie的过期时间
-            check_cookie_expiry(&conf_clone, &feishu_webhook_url_clone).await;
+            if !feishu_webhook_url_clone.is_empty() {
+                check_cookie_expiry(&conf_clone, &feishu_webhook_url_clone).await;
+            }
             // 等待24小时后再次检查
             tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;
         }
@@ -302,22 +320,31 @@ async fn main() -> anyhow::Result<()> {
     
     // 设置全局panic钩子，捕获所有未处理的panic并发送飞书通知
     std::panic::set_hook(Box::new(move |panic_info| {
-        let message = match panic_info.payload().downcast_ref::<&str>() {
-            Some(s) => format!("❌ [VPN应用异常崩溃] 原因: {}", s),
+        let reason = match panic_info.payload().downcast_ref::<&str>() {
+            Some(s) => s.to_string(),
             None => match panic_info.payload().downcast_ref::<String>() {
-                Some(s) => format!("❌ [VPN应用异常崩溃] 原因: {}", s),
-                None => "❌ [VPN应用异常崩溃] 原因: 未知错误".to_string(),
+                Some(s) => s.to_string(),
+                None => "未知错误".to_string(),
             },
         };
-        
+        let message = format!(
+            "[VPN应用异常崩溃]\n{}原因: {}\n位置: {:?}",
+            account_str_clone_panic, reason, panic_info.location()
+        );
+
         log::error!("{}", message);
-        log::error!("panic occurred at {:?}", panic_info.location());
+
+        // panic 前若已修改过系统 DNS，先恢复到启动时的原始值，避免污染系统
+        #[cfg(target_os = "macos")]
+        dns::DNSManager::global_restore_dns();
         
         // 同步方式发送飞书通知，避免在panic时创建新的运行时
         // 注意：这里使用block_on可能会在某些环境下失败，但在大多数情况下应该可以工作
         // 如果失败，我们也不需要处理，因为程序已经在panic中
-        if let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() {
-            let _ = rt.block_on(utils::send_feishu_message(&feishu_webhook_url_clone_panic, &message));
+        if !feishu_webhook_url_clone_panic.is_empty() {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() {
+                let _ = rt.block_on(utils::send_feishu_message(&feishu_webhook_url_clone_panic, &message));
+            }
         }
     }));
 
@@ -327,8 +354,10 @@ async fn main() -> anyhow::Result<()> {
     if let Err(_) = utils::check_privilege() {
         log::error!("permission denied, try to run with sudo or as root");
         // 权限不足，发送飞书通知
-        let message = "❌ [VPN应用异常退出] 权限不足，请使用sudo或管理员权限运行";
-        let _ = utils::send_feishu_message(&feishu_webhook_url, message).await;
+        let message = format!("[VPN应用异常退出]\n{}权限不足，请使用sudo或管理员权限运行", account_str);
+        if !feishu_webhook_url.is_empty() {
+            let _ = utils::send_feishu_message(&feishu_webhook_url, &message).await;
+        }
         exit(EPERM);
     }
 
@@ -336,6 +365,18 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(target_os = "macos")]
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
+
+    // 在 VPN 修改 DNS 之前先抓取"原始系统 DNS"作为后续 restore 的基准。
+    // 用户若在配置中指定了 origin_dns，则优先使用配置值；否则动态从系统抓取。
+    #[cfg(target_os = "macos")]
+    if use_vpn_dns {
+        if let Err(e) = DNSManager::init_origin_dns(conf.origin_dns.as_deref()) {
+            log::warn!(
+                "failed to capture origin dns, dns restore may not work correctly: {}",
+                e
+            );
+        }
+    }
 
     match conf.server {
         Some(_) => {}
@@ -357,8 +398,10 @@ async fn main() -> anyhow::Result<()> {
                     err
                 );
                 // 获取公司服务器失败，发送飞书通知
-                let message = format!("❌ [VPN应用异常退出] 获取公司服务器失败: {}", err);
-                let _ = utils::send_feishu_message(&feishu_webhook_url, &message).await;
+                let message = format!("[VPN应用异常退出]\n{}获取公司服务器失败: {}", account_str, err);
+                if !feishu_webhook_url.is_empty() {
+                    let _ = utils::send_feishu_message(&feishu_webhook_url, &message).await;
+                }
                 exit(EPERM);
             }
         },
@@ -443,49 +486,21 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
                                 log::info!("Checking DNS resolution for domain: {}", domain);
                                 if !utils::resolve_dns(domain) {
                                     log::warn!("DNS resolution failed for domain: {}", domain);
-                                    
-                                    // 在macOS上处理DNS设置
+
+                                    // 在macOS上恢复 DNS 到启动时抓取的"原始系统 DNS"
+                                    // （若配置了 origin_dns，init 时已使用其作为恢复目标）
                                     #[cfg(target_os = "macos")]
-                                    if use_vpn_dns {
-                                        let mut dns_manager = DNSManager::new();
-                                        if !dns_restored {
-                                            // 第一次尝试恢复默认DNS
-                                            log::info!("Attempting to restore default DNS settings");
-                                            if let Err(err) = dns_manager.restore_dns() {
-                                                log::warn!("Failed to restore default DNS: {}", err);
-                                            } else {
-                                                log::info!("Successfully restored default DNS settings");
-                                                dns_restored = true;
-                                                
-                                                // 恢复默认DNS后立即再次尝试解析域名
-                                                log::info!("Checking DNS resolution again after restoring default DNS");
-                                                if !utils::resolve_dns(domain) {
-                                                    log::warn!("DNS resolution still failed after restoring default DNS");
-                                                    // 如果仍然失败，立即尝试使用配置的origin_dns
-                                                    if let Some(origin_dns) = &c.conf.origin_dns {
-                                                        if !origin_dns.is_empty() {
-                                                            log::info!("Attempting to use origin DNS settings: {:?}", origin_dns);
-                                                            if let Err(err) = dns_manager.set_dns(origin_dns.iter().map(|s| s.as_str()).collect(), vec![]) {
-                                                                log::warn!("Failed to set origin DNS: {}", err);
-                                                            } else {
-                                                                log::info!("Successfully set origin DNS settings");
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                    if use_vpn_dns && !dns_restored {
+                                        log::info!("Attempting to restore default DNS settings");
+                                        DNSManager::global_restore_dns();
+                                        dns_restored = true;
+
+                                        // 恢复后立即再次尝试解析域名
+                                        log::info!("Checking DNS resolution again after restoring default DNS");
+                                        if utils::resolve_dns(domain) {
+                                            log::info!("DNS resolution succeeded after restoring default DNS");
                                         } else {
-                                            // 已经尝试过恢复默认DNS，直接尝试使用配置的origin_dns
-                                            if let Some(origin_dns) = &c.conf.origin_dns {
-                                                if !origin_dns.is_empty() {
-                                                    log::info!("Attempting to use origin DNS settings: {:?}", origin_dns);
-                                                    if let Err(err) = dns_manager.set_dns(origin_dns.iter().map(|s| s.as_str()).collect(), vec![]) {
-                                                        log::warn!("Failed to set origin DNS: {}", err);
-                                                    } else {
-                                                        log::info!("Successfully set origin DNS settings");
-                                                    }
-                                                }
-                                            }
+                                            log::warn!("DNS resolution still failed after restoring default DNS");
                                         }
                                     }
                                 }
@@ -496,13 +511,15 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
                                 retry_interval, connection_attempts);
                         
                         // 发送飞书通知
-                        let feishu_url = check_config.feishu_webhook_url.clone();
-                        let retry_msg = format!("⚠️ [VPN连接失败] 将在 {} 秒后重试 (第 {} 次尝试)", 
-                                           retry_interval, connection_attempts);
+                        let feishu_url = check_config.as_ref().map(|c| c.feishu_webhook_url.clone()).unwrap_or_default();
+                        let retry_msg = format!("[VPN连接失败]\n{}将在 {} 秒后重试 (第 {} 次尝试)", 
+                                           account_str_clone, retry_interval, connection_attempts);
                         log::info!("{}", retry_msg);
                         
-                        if let Err(msg_err) = send_feishu_message(&feishu_url, &retry_msg).await {
-                            log::warn!("Failed to send feishu message: {}", msg_err);
+                        if !feishu_url.is_empty() {
+                            if let Err(msg_err) = send_feishu_message(&feishu_url, &retry_msg).await {
+                                log::warn!("Failed to send feishu message: {}", msg_err);
+                            }
                         }
                         
                         // 等待重试间隔时间
@@ -530,18 +547,23 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
             
             // 获取接口地址并发送飞书消息
             let intranet_ip = wg_conf.address.split('/').next().unwrap_or("unknown");
-            let message = format!("✅ [内网连接成功] 检测到内网环境，IP地址: {}", intranet_ip);
+            let message = format!("[内网连接成功]\n{}检测到内网环境\nIP地址: {}", account_str, intranet_ip);
             log::info!("{}", message);
             
             // 更新配置文件中的代理server地址
-            if let Err(e) = yaml::update_config_yaml(&check_config.config_yaml_path, intranet_ip, &check_config.proxy_name_to_update, &check_config.svn_username, &check_config.svn_password) {
-                log::warn!("Failed to update config.yaml: {}", e);
-            } else {
-                log::info!("Successfully updated {} server address to {}", check_config.proxy_name_to_update, intranet_ip);
-            }
-            
-            if let Err(e) = send_feishu_message(&check_config.feishu_webhook_url, &message).await {
-                log::warn!("Failed to send feishu message: {}", e);
+            if let Some(cc) = &check_config {
+                if !cc.config_yaml_path.is_empty() {
+                    if let Err(e) = yaml::update_config_yaml(&cc.config_yaml_path, intranet_ip, &cc.proxy_name_to_update, &cc.svn_username, &cc.svn_password) {
+                        log::warn!("Failed to update config.yaml: {}", e);
+                    } else {
+                        log::info!("Successfully updated {} server address to {}", cc.proxy_name_to_update, intranet_ip);
+                    }
+                }
+                if !cc.feishu_webhook_url.is_empty() {
+                    if let Err(e) = send_feishu_message(&cc.feishu_webhook_url, &message).await {
+                        log::warn!("Failed to send feishu message: {}", e);
+                    }
+                }
             }
             
             // 仅运行保活逻辑
@@ -593,53 +615,54 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
             
             // 获取接口地址并发送飞书消息
             let name_async = name_clone.clone();
-            let feishu_url = check_config.feishu_webhook_url.clone();
-            let config_yaml_path = check_config.config_yaml_path.clone();
-            let proxy_name = check_config.proxy_name_to_update.clone();
-            let svn_username = check_config.svn_username.clone();
-            let svn_password = check_config.svn_password.clone();
+            let feishu_url = check_config.as_ref().map(|c| c.feishu_webhook_url.clone()).unwrap_or_default();
+            let config_yaml_path = check_config.as_ref().map(|c| c.config_yaml_path.clone()).unwrap_or_default();
+            let proxy_name = check_config.as_ref().map(|c| c.proxy_name_to_update.clone()).unwrap_or_default();
+            let svn_username = check_config.as_ref().map(|c| c.svn_username.clone()).unwrap_or_default();
+            let svn_password = check_config.as_ref().map(|c| c.svn_password.clone()).unwrap_or_default();
+            let account_str2 = account_str_clone.clone();
             tokio::spawn(async move {
                 match get_interface_address(&name_async) {
                     Ok(ip_address) => {
-                        let message = format!("✅ [VPN连接成功] IP地址: {}", ip_address);
-                        log::info!("{}", message);
+                        let message = format!("[VPN连接成功]\n{}IP地址: {}", account_str2, ip_address);
+                        // log::info!("{}", message);
                         
                         // 更新配置文件中的代理server地址
-                        if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
-                            log::warn!("Failed to update config.yaml: {}", e);
-                        } else {
-                            log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
+                        if !config_yaml_path.is_empty() {
+                            if let Err(e) = yaml::update_config_yaml(&config_yaml_path, &ip_address, &proxy_name, &svn_username, &svn_password) {
+                                log::warn!("Failed to update config.yaml: {}", e);
+                            } else {
+                                log::info!("Successfully updated {} server address to {}", proxy_name, ip_address);
+                            }
                         }
                         
-                        if let Err(e) = send_feishu_message(&feishu_url, &message).await {
-                            log::warn!("Failed to send feishu message: {}", e);
+                        if !feishu_url.is_empty() {
+                            if let Err(e) = send_feishu_message(&feishu_url, &message).await {
+                                log::warn!("Failed to send feishu message: {}", e);
+                            }
                         }
                     },
                     Err(e) => {
                         // 将错误转换为字符串，确保Send安全
                         let err_str = format!("{}", e);
                         log::warn!("Failed to get interface address: {}", err_str);
-                        let message = format!("✅ [VPN连接成功] 未能获取IP地址: {}", err_str);
+                        let message = format!("[VPN连接成功]\n{}未能获取IP地址: {}", account_str2, err_str);
                         log::warn!("{}", message);
-                        if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
-                            // 将错误转换为字符串，确保Send安全
-                            let msg_err_str = format!("{}", msg_err);
-                            log::warn!("Failed to send feishu message: {}", msg_err_str);
+                        if !feishu_url.is_empty() {
+                            if let Err(msg_err) = send_feishu_message(&feishu_url, &message).await {
+                                // 将错误转换为字符串，确保Send安全
+                                let msg_err_str = format!("{}", msg_err);
+                                log::warn!("Failed to send feishu message: {}", msg_err_str);
+                            }
                         }
                     }
                 }
             });
 
             #[cfg(target_os = "macos")]
-            let mut dns_manager = DNSManager::new();
-
-            #[cfg(target_os = "macos")]
             if use_vpn_dns {
-                match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::warn!("failed to set dns: {}", err);
-                    }
+                if let Err(err) = DNSManager::global_apply_dns(vec![&wg_conf.dns], vec![]) {
+                    log::warn!("failed to set dns: {}", err);
                 }
             }
 
@@ -706,12 +729,7 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
 
             #[cfg(target_os = "macos")]
             if use_vpn_dns {
-                match dns_manager.restore_dns() {
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::warn!("failed to delete dns: {}", err);
-                    }
-                }
+                DNSManager::global_restore_dns();
             }
         }
 
@@ -726,18 +744,23 @@ const MAX_RETRY_INTERVAL_SECONDS: u64 = 10;
         log::info!("preparing to reconnect VPN...");
         
         // 发送重连通知到飞书（如果配置允许）
-        if check_config.send_disconnect_notification {
-            let feishu_url = check_config.feishu_webhook_url.clone();
-            tokio::spawn(async move {
-                let message = format!("❌ [VPN连接断开] 正在尝试重连...");
-                if let Err(e) = send_feishu_message(&feishu_url, &message).await {
-                    // 将错误转换为字符串，确保Send安全
-                    let err_str = format!("{}", e);
-                    log::warn!("Failed to send feishu message: {}", err_str);
-                }
-            });
+        if let Some(cc) = &check_config {
+            if cc.send_disconnect_notification && !cc.feishu_webhook_url.is_empty() {
+                let feishu_url = cc.feishu_webhook_url.clone();
+                let account_str3 = account_str_clone.clone();
+                tokio::spawn(async move {
+                    let message = format!("[VPN连接断开]\n{}正在尝试重连...", account_str3);
+                    if let Err(e) = send_feishu_message(&feishu_url, &message).await {
+                        // 将错误转换为字符串，确保Send安全
+                        let err_str = format!("{}", e);
+                        log::warn!("Failed to send feishu message: {}", err_str);
+                    }
+                });
+            } else {
+                log::info!("VPN断开重连通知已禁用");
+            }
         } else {
-            log::info!("VPN断开重连通知已禁用");
+            log::info!("check_config.json 不存在，跳过断开重连通知");
         }
         
         // 重置登出重试标志

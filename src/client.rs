@@ -5,7 +5,7 @@ use std::path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::{fs, io::{self, BufRead}};
+use std::{fs, io::{self, Write}};
 use tokio::time::sleep;
 
 use cookie::Cookie as RawCookie;
@@ -349,48 +349,39 @@ impl Client {
     ) -> Result<String, Error> {
         log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
+        // 清屏，让二维码从终端第一行开始显示
+        print!("\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
         let code = TerminalQrCode::from_bytes(url.as_bytes());
         code.print();
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
-                log::info!("请在完成扫码验证后输入 'y' 继续");
-                let mut confirmed = false;
-                
-                // 持续等待用户输入，直到用户输入 'y' 或 'Y'
-                while !confirmed {
-                    let mut input = String::new();
-                    
-                    // 使用std::io::stdin().lock()来确保正确的输入缓冲处理
-                    let stdin = io::stdin();
-                    let mut lock = stdin.lock();
-                    
-                    match lock.read_line(&mut input) {
-                        Ok(n) => {
-                            if n > 0 {
-                                // 成功读取到输入
-                                let input_str = input.trim().to_lowercase();
-                                if input_str == "y" || input_str == "Y" {
-                                    confirmed = true;
-                                } else {
-                                    log::info!("输入无效，请输入 'y' 以继续");
-                                }
-                            } else {
-                                // 读取到EOF（可能是管道），等待后自动继续
-                                log::info!("检测到非交互式输入，等待10秒后自动继续...");
-                                std::thread::sleep(std::time::Duration::from_secs(10));
-                                // 设为true，避免无限循环
-                                confirmed = true;
-                            }
-                        },
+                // 轮询 check_tps_token 检测扫码是否完成：
+                // 用户扫码后，服务端 token 校验成功，自动继续。
+                // 无需人工输入 y/回车。
+                log::info!("请扫描二维码完成验证，扫码后自动继续...");
+
+                let start = std::time::Instant::now();
+                let timeout = Duration::from_secs(300); // 最长等待 5 分钟
+                let mut last_err = String::new();
+                loop {
+                    match self.check_tps_token(token).await {
+                        Ok(url) => {
+                            log::info!("扫码验证成功");
+                            return Ok(url);
+                        }
                         Err(e) => {
-                            log::error!("读取输入失败: {}", e);
-                            // 出错后等待一小段时间，避免无限循环
-                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            last_err = e.to_string();
+                            // 未扫码/未确认，继续轮询
+                            if start.elapsed() > timeout {
+                                log::warn!("扫码登录超时（5分钟）");
+                                return Err(Error::Error(format!("扫码登录超时: {}", last_err)));
+                            }
+                            log::debug!("等待扫码完成: {}", last_err);
+                            sleep(Duration::from_secs(2)).await;
                         }
                     }
                 }
-                
-                self.check_tps_token(token).await
             }
             _ => {
                 // TODO: add all tps login support
