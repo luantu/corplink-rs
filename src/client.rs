@@ -1,11 +1,13 @@
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fmt;
-use std::path;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{self, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::{fs, io::{self, Write}};
+use std::{fs, io};
 use tokio::time::sleep;
 
 use cookie::Cookie as RawCookie;
@@ -22,7 +24,9 @@ use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_LARK, PLATFORM_LDAP, PLATFORM_OIDC,
     STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
-use crate::qrcode::TerminalQrCode;
+use crate::login_observer::LoginObserver;
+#[cfg(feature = "full-client")]
+use crate::login_observer::TerminalLoginObserver;
 use crate::resp::*;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
@@ -30,6 +34,13 @@ use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 16; en)";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshOutcome {
+    Updated,
+    Verified,
+    AuthRequired,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -76,6 +87,12 @@ pub struct Client {
     c: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
+    cookie_file: PathBuf,
+    cookie_written: bool,
+    cookie_changed: bool,
+    defer_cookie_persistence: bool,
+    has_live_cookie: bool,
+    server_auth_rejected: bool,
 }
 
 unsafe impl Send for Client {}
@@ -115,63 +132,48 @@ pub async fn get_company_url(code: &str) -> Result<RespCompany, Error> {
 
 impl Client {
     pub fn new(conf: Config) -> Result<Client, Error> {
-        let f = conf.conf_file.clone().unwrap();
-        let dir = match path::Path::new(&f).parent() {
-            Some(dir) => dir,
-            None => path::Path::new("."),
-        };
-        let cookie_file = dir.join(format!(
-            "{}_{}",
-            conf.interface_name.clone().unwrap(),
-            COOKIE_FILE_SUFFIX
-        ));
-        log::info!("cookie file is: {}", cookie_file.to_str().unwrap());
+        let cookie_file = Self::derived_cookie_file(&conf)?;
+        Self::new_with_cookie_file(conf, cookie_file)
+    }
 
-        let mut cookie_store = {
-            let file_result = fs::File::open(&cookie_file).map(io::BufReader::new);
-            match file_result {
-                Ok(file) => {
-                    // 尝试使用serde_json::from_reader直接反序列化整个CookieStore对象
-                    match serde_json::from_reader(file) {
-                        Ok(store) => store,
-                        Err(e) => {
-                            // 如果失败，尝试使用旧的load_json_all方法
-                            log::warn!("Failed to deserialize cookie store, trying load_json_all: {}", e);
-                            let file = fs::File::open(&cookie_file).map(io::BufReader::new).unwrap();
-                            CookieStore::load_json_all(file).unwrap()
-                        }
-                    }
-                },
-                Err(_) => CookieStore::default(),
-            }
-        };
+    pub fn new_with_cookie_file(conf: Config, cookie_file: PathBuf) -> Result<Client, Error> {
+        let mut cookie_store = Self::load_cookie_store(&cookie_file)?;
+        let has_live_cookie = cookie_store.iter_any().any(|cookie| !cookie.is_expired());
         let has_expired = cookie_store.iter_any().any(|cookie| cookie.is_expired());
         if has_expired {
             log::info!("some cookies are expired");
         }
 
+        let server = conf
+            .server
+            .as_deref()
+            .ok_or_else(|| Error::Error("server configuration is missing".to_string()))?;
+        let server_url = Url::from_str(server)
+            .map_err(|_| Error::Error("server configuration is invalid".to_string()))?;
+        if server_url.domain().is_none() {
+            return Err(Error::Error("server configuration is invalid".to_string()));
+        }
+
         let mut headers = header::HeaderMap::new();
 
-        if let Some(server) = &conf.server.clone() {
-            let server_url = Url::from_str(server.as_str()).unwrap();
+        if let Some(device_id) = &conf.device_id {
+            let _ = cookie_store.insert_raw(&RawCookie::new("device_id", device_id), &server_url);
+        }
+        if let Some(device_name) = &conf.device_name {
+            let _ =
+                cookie_store.insert_raw(&RawCookie::new("device_name", device_name), &server_url);
+        }
 
-            if let Some(device_id) = &conf.device_id.clone() {
-                let _ =
-                    cookie_store.insert_raw(&RawCookie::new("device_id", device_id), &server_url);
-            }
-            if let Some(device_name) = &conf.device_name.clone() {
-                let _ = cookie_store
-                    .insert_raw(&RawCookie::new("device_name", device_name), &server_url);
-            }
-
-            if let Some(csrf_token) =
-                cookie_store.get(server_url.domain().unwrap(), "/", "csrf-token")
-            {
-                headers.insert(
-                    "csrf-token",
-                    header::HeaderValue::from_str(csrf_token.value()).unwrap(),
-                );
-            }
+        if let Some(csrf_token) = cookie_store.get(
+            server_url
+                .domain()
+                .ok_or_else(|| Error::Error("server configuration is invalid".to_string()))?,
+            "/",
+            "csrf-token",
+        ) {
+            let csrf_token = header::HeaderValue::from_str(csrf_token.value())
+                .map_err(|_| Error::Error("cookie store contains an invalid header".to_string()))?;
+            headers.insert("csrf-token", csrf_token);
         }
 
         let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
@@ -179,64 +181,144 @@ impl Client {
         let c = ClientBuilder::new()
             // allow invalid certs because this cert is signed by corplink
             .danger_accept_invalid_certs(true)
-            // for debug
-            // .proxy(reqwest::Proxy::all("socks5://192.168.111.233:8001").unwrap())
             .user_agent(USER_AGENT)
             .cookie_provider(Arc::clone(&cookie_store))
             .default_headers(headers)
             .timeout(Duration::from_millis(10000))
-            .build();
-        if let Err(err) = c {
-            return Err(Error::ReqwestError(err));
-        }
+            .build()
+            .map_err(Error::ReqwestError)?;
         let conf_bak = conf.clone();
-        let c = c.unwrap();
         Ok(Client {
             conf,
             cookie: Arc::clone(&cookie_store),
             c,
             api_url: ApiUrl::new(&conf_bak),
             date_offset_sec: 0,
+            cookie_file,
+            cookie_written: false,
+            cookie_changed: false,
+            defer_cookie_persistence: false,
+            has_live_cookie,
+            server_auth_rejected: false,
         })
     }
 
-    async fn change_state(&mut self, state: State) {
-        self.conf.state = Some(state);
-        let _ = self.conf.save().await;
+    fn derived_cookie_file(conf: &Config) -> Result<PathBuf, Error> {
+        let f = conf
+            .conf_file
+            .as_deref()
+            .ok_or_else(|| Error::Error("configuration file path is missing".to_string()))?;
+        let dir = match path::Path::new(&f).parent() {
+            Some(dir) => dir,
+            None => path::Path::new("."),
+        };
+        let interface_name = conf
+            .interface_name
+            .as_deref()
+            .ok_or_else(|| Error::Error("interface name is missing".to_string()))?;
+        Ok(dir.join(format!("{interface_name}_{COOKIE_FILE_SUFFIX}")))
     }
 
-    fn save_cookie(&self) {
-        // 使用与Client::new相同的逻辑构建cookie文件路径
-        // 基于配置文件的父目录，避免在只读文件系统上写入
-        if let Some(conf_file) = &self.conf.conf_file {
-            let dir = match path::Path::new(&conf_file).parent() {
-                Some(dir) => dir,
-                None => path::Path::new("."),
-            };
-            let cookie_file = dir.join(format!(
-                "{}_{}",
-                self.conf.interface_name.clone().unwrap(),
-                COOKIE_FILE_SUFFIX
-            ));
-            
-            // 创建一个临时缓冲区来写入cookie数据
-            let mut buffer = Vec::new();
-            {
-                let c = self.cookie.lock().unwrap();
-                // 使用serde_json::to_writer直接序列化整个CookieStore对象，生成一个合法的JSON数组
-                if let Err(e) = serde_json::to_writer(&mut buffer, &*c) {
-                    log::error!("Failed to serialize cookie store: {}", e);
-                    return;
+    fn load_cookie_store(cookie_file: &PathBuf) -> Result<CookieStore, Error> {
+        log::info!("cookie file is: {}", cookie_file.display());
+        match fs::File::open(cookie_file) {
+            Ok(file) => match serde_json::from_reader(io::BufReader::new(file)) {
+                Ok(store) => Ok(store),
+                Err(_) => {
+                    let file = fs::File::open(cookie_file)
+                        .map_err(|_| Error::Error("cookie store could not be read".to_string()))?;
+                    CookieStore::load_json_all(io::BufReader::new(file))
+                        .map_err(|_| Error::Error("cookie store is invalid".to_string()))
                 }
-            }
-            
-            // 一次性写入整个文件，确保生成的JSON格式正确
-            if let Err(e) = fs::write(&cookie_file, buffer) {
-                log::error!("Failed to write cookie file: {}", e);
-            }
-        } else {
-            log::error!("No configuration file path available to determine cookie file location");
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CookieStore::default()),
+            Err(_) => Err(Error::Error("cookie store could not be read".to_string())),
         }
+    }
+
+    async fn change_state(&mut self, state: State) -> Result<(), Error> {
+        self.conf.state = Some(state);
+        self.conf.save().await.map_err(Error::from)
+    }
+
+    fn save_cookie(&mut self) -> Result<bool, Error> {
+        if !self.cookie_changed {
+            return Ok(false);
+        }
+
+        let mut buffer = Vec::new();
+        let c = self
+            .cookie
+            .lock()
+            .map_err(|_| Error::Error("cookie store lock failed".to_string()))?;
+        serde_json::to_writer(&mut buffer, &*c)
+            .map_err(|_| Error::Error("cookie store serialization failed".to_string()))?;
+
+        let parent = self
+            .cookie_file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| Error::Error("cookie store parent directory is missing".to_string()))?;
+        let name = self
+            .cookie_file
+            .file_name()
+            .ok_or_else(|| Error::Error("cookie store file name is missing".to_string()))?;
+
+        let mut random = [0_u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random);
+        let random_suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let temp_file = parent.join(format!(".{}.{}.tmp", name.to_string_lossy(), random_suffix));
+
+        let write_result = (|| -> Result<(), Error> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_file).map_err(|_| {
+                Error::Error("cookie store temporary file could not be created".to_string())
+            })?;
+            #[cfg(not(unix))]
+            {
+                let mut permissions = file
+                    .metadata()
+                    .map_err(|_| {
+                        Error::Error("cookie store permissions could not be read".to_string())
+                    })?
+                    .permissions();
+                permissions.set_readonly(false);
+                file.set_permissions(permissions).map_err(|_| {
+                    Error::Error("cookie store permissions could not be set".to_string())
+                })?;
+            }
+            file.write_all(&buffer)
+                .map_err(|_| Error::Error("cookie store write failed".to_string()))?;
+            file.sync_all()
+                .map_err(|_| Error::Error("cookie store sync failed".to_string()))?;
+            drop(file);
+
+            let validation_file = fs::File::open(&temp_file)
+                .map_err(|_| Error::Error("cookie store validation read failed".to_string()))?;
+            let _: CookieStore = serde_json::from_reader(io::BufReader::new(validation_file))
+                .map_err(|_| Error::Error("cookie store validation failed".to_string()))?;
+
+            fs::rename(&temp_file, &self.cookie_file)
+                .map_err(|_| Error::Error("cookie store replace failed".to_string()))?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_file);
+        }
+        write_result?;
+        self.cookie_changed = false;
+        self.cookie_written = true;
+        Ok(true)
     }
 
     async fn request<T: DeserializeOwned + fmt::Debug>(
@@ -260,20 +342,20 @@ impl Client {
         };
         // TODO: handle special cases
         if !resp.status().is_success() {
-            let msg = format!("logout because of bad resp code: {}", resp.status());
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                self.server_auth_rejected = true;
+            }
+            let msg = format!("logout because of bad resp code: {status}");
             return Err(self.handle_logout_err(msg).await);
         }
 
         self.parse_time_offset_from_date_header(&resp);
 
-        for (name, _) in resp.headers() {
-            if name.to_string().to_lowercase() == "set-cookie" {
-                log::info!("found set-cookie in header, saving cookie");
-                self.save_cookie();
-                break;
-            }
-        }
-        
+        let has_set_cookie = resp.headers().contains_key(header::SET_COOKIE);
+
         // 添加详细日志，输出原始响应内容，帮助定位JSON解析错误
         let raw_body = resp.text().await;
         match raw_body {
@@ -287,9 +369,18 @@ impl Client {
                         return Err(Error::Error(format!("failed to parse response: {}", err)));
                     }
                 };
+                if resp.code == 101 {
+                    self.server_auth_rejected = true;
+                }
+                if has_set_cookie {
+                    self.cookie_changed = true;
+                    if !self.defer_cookie_persistence {
+                        self.save_cookie()?;
+                    }
+                }
                 log::debug!("api {:#?} parsed resp: {:#?}", api, resp);
                 Ok(resp)
-            },
+            }
             Err(err) => {
                 log::error!("failed to read response body: {}", err);
                 return Err(Error::ReqwestError(err));
@@ -333,33 +424,34 @@ impl Client {
             .request::<RespLogin>(ApiName::TpsTokenCheck, Some(m))
             .await?;
         match resp.code {
-            0 => Ok(resp.data.unwrap().url),
+            0 => resp.data.map(|data| data.url).ok_or_else(|| {
+                Error::Error("third party token response is incomplete".to_string())
+            }),
             _ => {
-                let msg = resp.message.unwrap();
+                let msg = resp
+                    .message
+                    .unwrap_or_else(|| "third party token check failed".to_string());
                 Err(Error::Error(msg))
             }
         }
     }
 
-    async fn get_otp_uri_from_tps(
+    async fn get_otp_uri_from_tps<O: LoginObserver>(
         &mut self,
         method: &str,
         url: &String,
         token: &String,
+        observer: &mut O,
     ) -> Result<String, Error> {
-        log::info!("old token is: {token}");
-        log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
-        // 清屏，让二维码从终端第一行开始显示
-        print!("\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
-        let code = TerminalQrCode::from_bytes(url.as_bytes());
-        code.print();
+        observer
+            .login_url(url, Utc::now() + chrono::Duration::minutes(5))
+            .map_err(Error::from)?;
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
                 // 轮询 check_tps_token 检测扫码是否完成：
                 // 用户扫码后，服务端 token 校验成功，自动继续。
                 // 无需人工输入 y/回车。
-                log::info!("请扫描二维码完成验证，扫码后自动继续...");
+                observer.waiting().map_err(Error::from)?;
 
                 let start = std::time::Instant::now();
                 let timeout = Duration::from_secs(300); // 最长等待 5 分钟
@@ -367,7 +459,6 @@ impl Client {
                 loop {
                     match self.check_tps_token(token).await {
                         Ok(url) => {
-                            log::info!("扫码验证成功");
                             return Ok(url);
                         }
                         Err(e) => {
@@ -383,10 +474,7 @@ impl Client {
                     }
                 }
             }
-            _ => {
-                // TODO: add all tps login support
-                panic!("unsupported platform, please contact the developer");
-            }
+            _ => Err(Error::Error("unsupported third party platform".to_string())),
         }
     }
 
@@ -413,7 +501,9 @@ impl Client {
                 }
             }
         }
-        panic!("failed to login with corplink");
+        Err(Error::Error(
+            "no supported corplink login method".to_string(),
+        ))
     }
 
     async fn ldap_login(&mut self) -> Result<String, Error> {
@@ -431,7 +521,7 @@ impl Client {
                 };
             }
         }
-        panic!("failed to login with ldap");
+        Err(Error::Error("no supported ldap login method".to_string()))
     }
 
     fn is_platform_or_default(&self, platform: &str) -> bool {
@@ -445,20 +535,26 @@ impl Client {
         let m = Map::new();
         let resp = self.request::<RespOtp>(ApiName::Otp, Some(m)).await?;
         match resp.code {
-            0 => Ok(resp.data.unwrap().url),
+            0 => resp
+                .data
+                .map(|data| data.url)
+                .ok_or_else(|| Error::Error("otp response is incomplete".to_string())),
             _ => {
-                let msg = resp.message.unwrap();
+                let msg = resp
+                    .message
+                    .unwrap_or_else(|| "otp request failed".to_string());
                 Err(Error::Error(msg))
             }
         }
     }
 
-    async fn get_otp_uri_by_otp(
+    async fn get_otp_uri_by_otp<O: LoginObserver>(
         &mut self,
         tps_login: &HashMap<String, RespTpsLoginMethod>,
         method: &String,
+        observer: &mut O,
     ) -> Result<String, Error> {
-        return match self.get_otp_uri(tps_login, method).await {
+        return match self.get_otp_uri(tps_login, method, observer).await {
             Ok(url) => {
                 if url == "" {
                     self.request_otp_code().await
@@ -469,16 +565,17 @@ impl Client {
             Err(e) => Err(e),
         };
     }
-    async fn get_otp_uri(
+    async fn get_otp_uri<O: LoginObserver>(
         &mut self,
         tps_login: &HashMap<String, RespTpsLoginMethod>,
         method: &String,
+        observer: &mut O,
     ) -> Result<String, Error> {
         if tps_login.contains_key(method) && self.is_platform_or_default(method) {
             log::info!("try to login with third party platform {method}");
             let resp = tps_login.get(method).unwrap();
             return self
-                .get_otp_uri_from_tps(method, &resp.login_url, &resp.token)
+                .get_otp_uri_from_tps(method, &resp.login_url, &resp.token, observer)
                 .await;
         }
         match method.as_str() {
@@ -500,7 +597,16 @@ impl Client {
     }
 
     // choose right login method and login
+    #[cfg(feature = "full-client")]
     pub async fn login(&mut self) -> Result<(), Error> {
+        let mut observer = TerminalLoginObserver;
+        self.login_with_observer(&mut observer).await
+    }
+
+    pub async fn login_with_observer<O: LoginObserver>(
+        &mut self,
+        observer: &mut O,
+    ) -> Result<(), Error> {
         let resp = self.get_login_method().await?;
         let tps_login_resp = self.get_tps_login_method().await?;
         let mut tps_login = HashMap::new();
@@ -508,7 +614,7 @@ impl Client {
             tps_login.insert(resp.alias.clone(), resp);
         }
         for method in resp.login_orders {
-            let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method).await;
+            let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method, observer).await;
             if let Err(e) = otp_uri {
                 log::warn!("failed to login with method {method}: {e}");
                 continue;
@@ -518,34 +624,42 @@ impl Client {
                 log::warn!("failed to login with method {method}");
                 continue;
             }
-            self.change_state(State::Login).await;
+            self.change_state(State::Login).await?;
 
-            let url = Url::parse(&otp_uri).unwrap();
+            let url = Url::parse(&otp_uri)
+                .map_err(|_| Error::Error("login completion URL is invalid".to_string()))?;
             for (k, v) in url.query_pairs() {
                 if k == "secret" {
                     log::info!("got 2fa token: {}", &v);
                     self.conf.code = Some(v.to_string());
-                    let _ = self.conf.save().await;
                     break;
                 }
             }
 
             if let Some(code) = &self.conf.code {
                 if !code.is_empty() {
+                    self.conf.save().await.map_err(Error::from)?;
+                    let cookie_written = self.save_cookie()?;
+                    observer
+                        .succeeded(cookie_written, true)
+                        .map_err(Error::from)?;
                     return Ok(());
                 }
             }
             log::warn!("failed to get otp code");
             return Ok(());
         }
-        panic!("no available login method, please provide a valid platform")
+        Err(Error::Error(
+            "no available login method for configured platform".to_string(),
+        ))
     }
 
     async fn get_login_method(&mut self) -> Result<RespLoginMethod, Error> {
         let resp = self
             .request::<RespLoginMethod>(ApiName::LoginMethod, None)
             .await?;
-        Ok(resp.data.unwrap())
+        resp.data
+            .ok_or_else(|| Error::Error("login settings response is incomplete".to_string()))
     }
 
     // get 3rd party login methods and links, only lark(feishu) is tested
@@ -639,7 +753,7 @@ impl Client {
     }
 
     async fn handle_logout_err(&mut self, msg: String) -> Error {
-        self.change_state(State::Init).await;
+        let _ = self.change_state(State::Init).await;
         Error::Error(format!("operation failed because of logout: {}", msg))
     }
 
@@ -663,7 +777,7 @@ impl Client {
         // 设置重试次数为3次
         const MAX_RETRIES: i32 = 3;
         let mut retries = 0;
-        
+
         // 配置cookie
         {
             let mut cookie = self.cookie.lock().unwrap();
@@ -686,21 +800,25 @@ impl Client {
             }
             self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
         }
-        self.save_cookie();
-        
         // 重试循环
         while retries < MAX_RETRIES {
             if retries > 0 {
-                log::info!("retrying ping to {}:{}, attempt {}/{}", ip, api_port, retries + 1, MAX_RETRIES);
+                log::info!(
+                    "retrying ping to {}:{}, attempt {}/{}",
+                    ip,
+                    api_port,
+                    retries + 1,
+                    MAX_RETRIES
+                );
                 // 每次重试前等待100ms
                 sleep(Duration::from_millis(100)).await;
             }
-            
+
             let req_start = Utc::now().timestamp_millis();
             let result = self.request::<String>(ApiName::PingVPN, None).await;
             let req_end = Utc::now().timestamp_millis();
             let latency = req_end - req_start;
-            
+
             match result {
                 Ok(resp) => match resp.code {
                     0 => return latency,
@@ -715,17 +833,24 @@ impl Client {
                 Err(err) => {
                     // 特别处理连接超时错误
                     if err.to_string().contains("Operation timed out") {
-                        log::warn!("failed to ping {}:{}: {} (attempt {}/{})
-", ip, api_port, err, retries + 1, MAX_RETRIES);
+                        log::warn!(
+                            "failed to ping {}:{}: {} (attempt {}/{})
+",
+                            ip,
+                            api_port,
+                            err,
+                            retries + 1,
+                            MAX_RETRIES
+                        );
                     } else {
                         log::warn!("failed to ping {}:{}: {}", ip, api_port, err);
                     }
                 }
             }
-            
+
             retries += 1;
         }
-        
+
         // 所有重试都失败
         -1
     }
@@ -734,15 +859,15 @@ impl Client {
     async fn ping_vpn_with_backup_ips(&mut self, vpn: &RespVpnInfo) -> (String, i64) {
         let mut best_ip = vpn.ip.clone();
         let mut best_latency = i64::MAX;
-        
+
         // 收集所有要测试的IP
         let mut ips_to_test = vec![vpn.ip.clone()];
-        
+
         // 处理备用IP，如果存在的话
         if let Some(backup_ips) = &vpn.backup_ips {
             ips_to_test.extend(backup_ips.clone());
         }
-        
+
         // 测试每个IP的延迟
         for ip in ips_to_test {
             // 检查IP是否在bypass列表中，如果在就跳过
@@ -752,9 +877,9 @@ impl Client {
                     continue;
                 }
             }
-            
+
             let latency = self.ping_single_ip(ip.clone(), vpn.api_port).await;
-            
+
             if latency != -1 {
                 log::info!("{} - {}: latency {}ms", vpn.name, ip, latency);
                 if latency < best_latency {
@@ -765,7 +890,7 @@ impl Client {
                 log::info!("{} - {}: timeout", vpn.name, ip);
             }
         }
-        
+
         if best_latency == i64::MAX {
             // 所有IP都测试失败
             (best_ip, -1)
@@ -780,10 +905,10 @@ impl Client {
     ) -> Option<RespVpnInfo> {
         let mut fast_vpn = None;
         let mut min_latency = i64::MAX;
-        
+
         for mut vpn in vpn_info {
             let (best_ip, latency) = self.ping_vpn_with_backup_ips(&vpn).await;
-            
+
             // 如果找到更好的IP，更新VPN的主IP
             if latency != -1 && latency < min_latency {
                 vpn.ip = best_ip;
@@ -804,6 +929,120 @@ impl Client {
             }
         }
         None
+    }
+
+    async fn select_vpn(&mut self) -> Result<RespVpnInfo, Error> {
+        let vpn_info = self.list_vpn().await?;
+
+        log::info!("found {} vpn(s)", vpn_info.len());
+        for vpn in &vpn_info {
+            log::info!(
+                "VPN server info: id={}, name={}, ip={}, api_port={}, vpn_port={}, protocol_mode={}, timeout={}",
+                vpn.id,
+                vpn.name,
+                vpn.ip,
+                vpn.api_port,
+                vpn.vpn_port,
+                vpn.protocol_mode,
+                vpn.timeout
+            );
+        }
+        let filtered_vpn = vpn_info
+            .into_iter()
+            .filter(|vpn| {
+                if let Some(server_name) = self.conf.vpn_server_name.clone() {
+                    if vpn.name != server_name {
+                        log::info!("skip {}, expect {}", vpn.name, server_name);
+                        return false;
+                    }
+                }
+                true
+            })
+            .filter(|vpn| {
+                let mode = match vpn.protocol_mode {
+                    1 => "tcp",
+                    2 => "udp",
+                    _ => "unknown protocol",
+                };
+                log::debug!(
+                    "VPN server {} protocol mode: {}, value: {}",
+                    vpn.name,
+                    mode,
+                    vpn.protocol_mode
+                );
+                match mode {
+                    "udp" => {
+                        log::info!("Server {} supports UDP mode", vpn.name);
+                        true
+                    }
+                    "tcp" => {
+                        log::info!("Server {} only supports TCP mode", vpn.name);
+                        true
+                    }
+                    _ => {
+                        log::info!(
+                            "server name {} is not support {} wg for now",
+                            vpn.name,
+                            mode
+                        );
+                        false
+                    }
+                }
+            })
+            .collect();
+
+        let vpn = match self.conf.vpn_select_strategy.clone() {
+            Some(strategy) => match strategy.as_str() {
+                STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered_vpn).await,
+                STRATEGY_DEFAULT => self.get_first_available_vpn(filtered_vpn).await,
+                _ => return Err(Error::Error("unsupported strategy".to_string())),
+            },
+            None => self.get_first_available_vpn(filtered_vpn).await,
+        };
+
+        vpn.ok_or_else(|| Error::Error("no vpn available".to_string()))
+    }
+
+    fn use_selected_vpn(&mut self, vpn: &RespVpnInfo) {
+        // Preserve the original client endpoint construction for the selected node.
+        self.api_url.vpn_param.url = format!("https://{}:{}", vpn.ip, vpn.api_port);
+    }
+
+    pub async fn refresh_cookie_once(&mut self) -> Result<RefreshOutcome, Error> {
+        if !self.has_live_cookie {
+            return Ok(RefreshOutcome::AuthRequired);
+        }
+
+        self.cookie_written = false;
+        self.server_auth_rejected = false;
+        self.defer_cookie_persistence = true;
+
+        let result = async {
+            let vpn = self.select_vpn().await?;
+            self.use_selected_vpn(&vpn);
+            let public_key = self
+                .conf
+                .public_key
+                .clone()
+                .ok_or_else(|| Error::Error("public key is missing".to_string()))?;
+
+            // This deliberately ends at the original /vpn/conn implementation. The returned
+            // tunnel parameters are discarded so refresh never creates a local tunnel.
+            let _ = self.fetch_peer_info(&public_key).await?;
+            let cookie_updated = self.save_cookie()?;
+            Ok(if cookie_updated {
+                RefreshOutcome::Updated
+            } else {
+                RefreshOutcome::Verified
+            })
+        }
+        .await;
+
+        self.defer_cookie_persistence = false;
+        match result {
+            Err(_error) if self.server_auth_rejected => Ok(RefreshOutcome::AuthRequired),
+            other => other,
+        }
     }
 
     // ping vpn and return latency in ms. Will return -1 on error
@@ -854,19 +1093,19 @@ impl Client {
         if let Some(_intranet_domain) = &self.conf.intranet_domain {
             if utils::is_in_intranet(&self.conf.intranet_domain) {
                 log::info!("检测到内网环境，不需要建立VPN连接");
-                
+
                 // 获取默认路由IP
                 match utils::get_default_route_ip() {
                     Ok(intranet_ip) => {
                         log::info!("获取到默认路由IP: {}", intranet_ip);
-                        
+
                         // 发送内网IP到飞书
                         // let check_config = crate::config::read_check_config(self.conf.check_config_path.as_deref());
                         // let feishu_message = format!("检测到内网环境，当前出口IP: {}", intranet_ip);
                         // if let Err(e) = utils::send_feishu_message(&check_config.feishu_webhook_url, &feishu_message).await {
                         //     log::warn!("发送飞书消息失败: {}", e);
                         // }
-                        
+
                         // 返回一个空的WgConf，仅设置内网相关字段
                         // 因为在内网环境下不需要实际的VPN配置
                         return Ok(WgConf {
@@ -883,89 +1122,22 @@ impl Client {
                             use_intranet: true,
                             intranet_domain: self.conf.intranet_domain.clone(),
                         });
-                    },
+                    }
                     Err(e) => {
                         log::warn!("获取默认路由IP失败: {}, 继续执行VPN连接逻辑", e);
                     }
                 }
             }
         }
-        
+
         // 非内网环境，执行正常的VPN连接逻辑
-        let vpn_info = self.list_vpn().await?;
+        let vpn = self.select_vpn().await?;
 
-        log::info!("found {} vpn(s)", vpn_info.len());
-        for vpn in &vpn_info {
-            log::info!(
-                "VPN server info: id={}, name={}, ip={}, api_port={}, vpn_port={}, protocol_mode={}, timeout={}",
-                vpn.id,
-                vpn.name,
-                vpn.ip,
-                vpn.api_port,
-                vpn.vpn_port,
-                vpn.protocol_mode,
-                vpn.timeout
-            );
-        }
-        let filtered_vpn = vpn_info
-            .into_iter()
-            .filter(|vpn| {
-                if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.name != server_name {
-                        log::info!("skip {}, expect {}", vpn.name, server_name);
-                        return false;
-                    }
-                }
-                true
-            })
-            .filter(|vpn| {
-                let mode = match vpn.protocol_mode {
-                    1 => "tcp",
-                    2 => "udp",
-                    _ => "unknown protocol",
-                };
-                log::debug!("VPN server {} protocol mode: {}, value: {}", vpn.name, mode, vpn.protocol_mode);
-                match mode {
-                    "udp" => {
-                        log::info!("Server {} supports UDP mode", vpn.name);
-                        true
-                    },
-                    "tcp" => {
-                        log::info!("Server {} only supports TCP mode", vpn.name);
-                        true
-                    },
-                    _ => {
-                        log::info!(
-                            "server name {} is not support {} wg for now",
-                            vpn.name,
-                            mode
-                        );
-                        false
-                    }
-                }
-            })
-            .collect();
-
-        let vpn = match self.conf.vpn_select_strategy.clone() {
-            Some(strategy) => match strategy.as_str() {
-                STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered_vpn).await,
-                STRATEGY_DEFAULT => self.get_first_available_vpn(filtered_vpn).await,
-                _ => return Err(Error::Error("unsupported strategy".to_string())),
-            },
-            None => self.get_first_available_vpn(filtered_vpn).await,
-        };
-
-        let vpn = match vpn {
-            Some(ref vpn) => vpn,
-            None => return Err(Error::Error("no vpn available".to_string())),
-        };
-        
         let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
         log::info!("try connect to {}, address {}", vpn.name, vpn_addr);
-        
+
         // 更新API URL参数，确保使用正确的VPN服务器地址
-        let server_url = format!("https://{}:{}", vpn.ip, vpn.api_port);
-        self.api_url.vpn_param.url = server_url;
+        self.use_selected_vpn(&vpn);
 
         let key = self.conf.public_key.clone().unwrap();
         log::info!("try to get wg conf from remote");
@@ -979,7 +1151,11 @@ impl Client {
         let address6 = (!wg_info.ipv6.is_empty())
             .then_some(format!("{}/128", wg_info.ipv6))
             .unwrap_or("".into());
-        let route = [wg_info.setting.vpn_route_split, wg_info.setting.v6_route_split.unwrap_or_default()].concat();
+        let route = [
+            wg_info.setting.vpn_route_split,
+            wg_info.setting.v6_route_split.unwrap_or_default(),
+        ]
+        .concat();
 
         // 确定协议模式
         let protocol = if let Some(forced_mode) = self.conf.protocol_mode {
@@ -989,7 +1165,12 @@ impl Client {
                 1 => "TCP",
                 _ => "Unknown",
             };
-            log::info!("Forcing protocol mode: {} ({}), ignoring server value: {}", mode_str, forced_mode, vpn.protocol_mode);
+            log::info!(
+                "Forcing protocol mode: {} ({}), ignoring server value: {}",
+                mode_str,
+                forced_mode,
+                vpn.protocol_mode
+            );
             forced_mode
         } else {
             // 使用服务器返回的协议模式
@@ -998,19 +1179,23 @@ impl Client {
                 1 => {
                     log::info!("Using TCP mode for server {}", vpn.name);
                     1
-                },
+                }
                 // udp
                 2 => {
                     log::info!("Using UDP mode for server {}", vpn.name);
                     0
-                },
+                }
                 _ => {
-                    log::warn!("Unknown protocol mode {} for server {}, defaulting to UDP", vpn.protocol_mode, vpn.name);
+                    log::warn!(
+                        "Unknown protocol mode {} for server {}, defaulting to UDP",
+                        vpn.protocol_mode,
+                        vpn.name
+                    );
                     0
-                },
+                }
             }
         };
-        
+
         // corplink config
         let wg_conf = WgConf {
             address,
@@ -1026,8 +1211,11 @@ impl Client {
             use_intranet: false,
             intranet_domain: self.conf.intranet_domain.clone(),
         };
-        
-        log::info!("Created WgConf with protocol mode: {} (0=UDP, 1=TCP)", protocol);
+
+        log::info!(
+            "Created WgConf with protocol mode: {} (0=UDP, 1=TCP)",
+            protocol
+        );
         Ok(wg_conf)
     }
 
@@ -1035,7 +1223,7 @@ impl Client {
         let mut consecutive_errors = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 5;
         const KEEP_ALIVE_INTERVAL: u64 = 10; // 所有环境下统一使用10秒保活间隔
-        
+
         loop {
             let keep_alive_success = if conf.use_intranet && conf.intranet_domain.is_some() {
                 // 在内网环境，使用ping方式保活
@@ -1049,7 +1237,7 @@ impl Client {
                 // 在外网环境，使用原来的report_vpn_status方式
                 self.report_vpn_status(conf).await.is_ok()
             };
-            
+
             if keep_alive_success {
                 // 成功时重置错误计数器
                 consecutive_errors = 0;
@@ -1057,14 +1245,14 @@ impl Client {
             } else {
                 consecutive_errors += 1;
                 log::warn!("保活失败 (连续失败次数 {}): 触发重试", consecutive_errors);
-                
+
                 // 如果连续错误超过5次，则返回，触发重连
                 if consecutive_errors > MAX_CONSECUTIVE_ERRORS {
                     log::error!("连续失败次数超过 {}, 触发重连", MAX_CONSECUTIVE_ERRORS);
                     return;
                 }
             }
-            
+
             // 所有环境下统一使用10秒间隔保活
             tokio::time::sleep(Duration::from_secs(KEEP_ALIVE_INTERVAL)).await;
         }

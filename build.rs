@@ -1,11 +1,15 @@
-use std::env;
-use std::path::PathBuf;
+#[cfg(feature = "full-client")]
 use bindgen::callbacks::{IntKind, ParseCallbacks};
+#[cfg(feature = "full-client")]
+use std::env;
+#[cfg(feature = "full-client")]
+use std::path::PathBuf;
 
-
+#[cfg(feature = "full-client")]
 #[derive(Debug)]
 struct DefineParser;
 
+#[cfg(feature = "full-client")]
 impl ParseCallbacks for DefineParser {
     fn int_macro(&self, _name: &str, value: i64) -> Option<IntKind> {
         if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
@@ -17,6 +21,20 @@ impl ParseCallbacks for DefineParser {
 }
 
 fn main() {
+    #[cfg(all(feature = "login-helper", not(feature = "full-client")))]
+    {
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LOGIN_HELPER");
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FULL_CLIENT");
+        println!("cargo:rerun-if-changed=./libwg/libwg.h");
+        return;
+    }
+
+    #[cfg(feature = "full-client")]
+    full_client_main();
+}
+
+#[cfg(feature = "full-client")]
+fn full_client_main() {
     // Tell cargo to look for shared libraries in the specified directory
     println!("cargo:rustc-link-search=./libwg");
 
@@ -35,13 +53,9 @@ fn main() {
         .header("./libwg/libwg.h")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
-        .parse_callbacks(Box::new(
-            bindgen::CargoCallbacks,
-        ))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         // parse number define macro as i32 instead of u32
-        .parse_callbacks(Box::new(
-            DefineParser,
-        ))
+        .parse_callbacks(Box::new(DefineParser))
         // Finish the builder and generate the bindings.
         .generate()
         // Unwrap the Result and panic on failure.
