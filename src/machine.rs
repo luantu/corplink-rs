@@ -6,7 +6,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Config, PLATFORM_LARK, PLATFORM_OIDC};
+use crate::config::{
+    Config, PLATFORM_CORPLINK, PLATFORM_LARK, PLATFORM_LDAP, PLATFORM_OIDC,
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_MACHINE_REQUEST_BYTES: usize = 64 * 1024;
@@ -41,6 +43,8 @@ pub struct MachineRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
@@ -69,17 +73,19 @@ impl MachineRequest {
         let username = required(self.username)?;
         let auth_file = required(self.auth_file)?;
         let cookie_file = required(self.cookie_file)?;
-        let platform = required(self.platform)?;
         validate_server(&server)?;
-        validate_platform(&platform)?;
+        let platform = self.platform.filter(|platform| !platform.is_empty());
+        if let Some(platform) = &platform {
+            validate_platform(platform)?;
+        }
 
         Ok(MachineClientConfig {
             cookie_file: PathBuf::from(cookie_file),
             config: Config {
                 company_name,
                 username,
-                password: None,
-                platform: Some(platform),
+                password: self.password,
+                platform,
                 code: None,
                 device_name: self
                     .device_name
@@ -129,7 +135,10 @@ fn validate_server(server: &str) -> Result<()> {
 }
 
 fn validate_platform(platform: &str) -> Result<()> {
-    if matches!(platform, PLATFORM_LARK | PLATFORM_OIDC) {
+    if matches!(
+        platform,
+        PLATFORM_CORPLINK | PLATFORM_LDAP | PLATFORM_LARK | PLATFORM_OIDC
+    ) {
         Ok(())
     } else {
         Err(anyhow!("invalid machine platform configuration"))
@@ -239,4 +248,30 @@ pub fn parse_request(bytes: &[u8]) -> std::result::Result<MachineRequest, Reques
     }
 
     serde_json::from_value(value).map_err(|_| RequestError::Invalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_login_request_accepts_omitted_platform_and_preserves_password() {
+        let request = br#"{
+            "protocol_version": 1,
+            "action": "login",
+            "server": "https://feilian.example.test",
+            "company_name": "Bettbox",
+            "username": "alice",
+            "password": "secret",
+            "auth_file": "/data/user/0/app/files/config.json",
+            "cookie_file": "/data/user/0/app/files/cookies.json"
+        }"#;
+
+        let request = parse_request(request).expect("request should parse");
+        let client = request
+            .into_client_config()
+            .expect("password login should not require a platform hint");
+        assert_eq!(client.config.password.as_deref(), Some("secret"));
+        assert_eq!(client.config.platform, None);
+    }
 }
