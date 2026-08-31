@@ -626,6 +626,7 @@ impl Client {
         for resp in tps_login_resp {
             tps_login.insert(resp.alias.clone(), resp);
         }
+        let mut last_error: Option<Error> = None;
         for method in resp.login_orders {
             // A configured platform is a hard selector.  In particular, a
             // Feilian password profile must skip an earlier lark/LDAP entry;
@@ -637,11 +638,14 @@ impl Client {
                 }
             }
             let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method, observer).await;
-            if let Err(e) = otp_uri {
-                log::warn!("failed to login with method {method}: {e}");
-                continue;
-            }
-            let otp_uri = otp_uri.unwrap();
+            let otp_uri = match otp_uri {
+                Ok(uri) => uri,
+                Err(e) => {
+                    log::warn!("failed to login with method {method}: {e}");
+                    last_error = Some(e);
+                    continue;
+                }
+            };
             if otp_uri.is_empty() {
                 log::warn!("failed to login with method {method}");
                 continue;
@@ -668,8 +672,12 @@ impl Client {
                     return Ok(());
                 }
             }
-            log::warn!("failed to get otp code");
-            return Ok(());
+            return Err(Error::Error(format!(
+                "login with method {method} returned no otp secret"
+            )));
+        }
+        if let Some(error) = last_error {
+            return Err(Error::Error(format!("login failed: {error}")));
         }
         Err(Error::Error(
             "no available login method for configured platform".to_string(),
