@@ -78,8 +78,8 @@ async fn run_login(request: corplink_rs::machine::MachineRequest) -> ExitCode {
 
     match client.login_with_observer(&mut observer).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => {
-            write_machine_error("LOGIN_FAILED", "Login did not complete.");
+        Err(error) => {
+            write_machine_error_message("LOGIN_FAILED", &error.to_string());
             eprintln!("machine login did not complete");
             ExitCode::from(1)
         }
@@ -191,7 +191,15 @@ fn machine_request_error(error: RequestError) -> ExitCode {
 }
 
 fn write_machine_error(code: &'static str, message: &'static str) {
+    write_machine_error_message(code, message);
+}
+
+fn write_machine_error_message(code: &'static str, message: &str) {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let _ = write_event(&mut stdout, &MachineEvent::error(code, message));
+    let mut event = MachineEvent::new(corplink_rs::machine::Event::Error);
+    event.code = Some(code.to_string());
+    event.message = Some(message.to_string());
+    event.retryable = Some(false);
+    let _ = write_event(&mut stdout, &event);
 }
