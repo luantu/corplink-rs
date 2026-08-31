@@ -331,7 +331,10 @@ impl Client {
         let rb = match body {
             Some(body) => {
                 let body = serde_json::to_string(&body).unwrap();
-                self.c.post(url).body(body)
+                self.c
+                    .post(url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
             }
             None => self.c.get(url),
         };
@@ -557,6 +560,16 @@ impl Client {
         return match self.get_otp_uri(tps_login, method, observer).await {
             Ok(url) => {
                 if url == "" {
+                    // A Feilian password login must return its authenticated
+                    // completion URL. Falling back to /api/v2/p/otp here
+                    // only creates a TOTP seed without establishing a
+                    // session, which later appears as a misleading
+                    // "Cookies are missing" response from /vpn/conn.
+                    if method == PLATFORM_CORPLINK {
+                        return Err(Error::Error(
+                            "feilian password login returned no completion URL".to_string(),
+                        ));
+                    }
                     self.request_otp_code().await
                 } else {
                     Ok(url)
