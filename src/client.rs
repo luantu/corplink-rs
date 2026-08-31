@@ -614,6 +614,15 @@ impl Client {
             tps_login.insert(resp.alias.clone(), resp);
         }
         for method in resp.login_orders {
+            // A configured platform is a hard selector.  In particular, a
+            // Feilian password profile must skip an earlier lark/LDAP entry;
+            // treating that filtered entry as an empty URI would incorrectly
+            // fall through to /api/v2/p/otp and report a fake login success.
+            if let Some(platform) = &self.conf.platform {
+                if !platform.is_empty() && platform != &method {
+                    continue;
+                }
+            }
             let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method, observer).await;
             if let Err(e) = otp_uri {
                 log::warn!("failed to login with method {method}: {e}");
