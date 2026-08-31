@@ -557,20 +557,19 @@ impl Client {
         method: &String,
         observer: &mut O,
     ) -> Result<String, Error> {
+        // A pure password Feilian login succeeds by establishing the session
+        // cookie and returning {"login_result":"success"} instead of a
+        // completion URL with a TOTP secret. The caller treats the empty URI
+        // as "authenticated, continue with the cookie that request() already
+        // persisted" rather than an error.
         return match self.get_otp_uri(tps_login, method, observer).await {
             Ok(url) => {
                 if url == "" {
-                    // A Feilian password login must return its authenticated
-                    // completion URL. Falling back to /api/v2/p/otp here
-                    // only creates a TOTP seed without establishing a
-                    // session, which later appears as a misleading
-                    // "Cookies are missing" response from /vpn/conn.
                     if method == PLATFORM_CORPLINK {
-                        return Err(Error::Error(
-                            "feilian password login returned no completion URL".to_string(),
-                        ));
+                        Ok(String::new())
+                    } else {
+                        self.request_otp_code().await
                     }
-                    self.request_otp_code().await
                 } else {
                     Ok(url)
                 }
@@ -647,6 +646,20 @@ impl Client {
                 }
             };
             if otp_uri.is_empty() {
+                // A Feilian password login can authenticate by cookie alone
+                // when the server returns {"login_result":"success"} without
+                // a completion URL (no TOTP binding). The session cookie was
+                // already persisted by request() on the login response, so
+                // treat this as a successful login.
+                if method == PLATFORM_CORPLINK {
+                    log::info!("feilian password login authenticated via session cookie");
+                    self.change_state(State::Login).await?;
+                    let cookie_written = self.save_cookie()?;
+                    observer
+                        .succeeded(cookie_written, true)
+                        .map_err(Error::from)?;
+                    return Ok(());
+                }
                 log::warn!("failed to login with method {method}");
                 continue;
             }
