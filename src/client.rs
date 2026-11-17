@@ -46,6 +46,7 @@ pub enum RefreshOutcome {
 pub enum Error {
     ReqwestError(reqwest::Error),
     Error(String),
+    PasswordLoginRejected(i32),
 }
 
 impl fmt::Display for Error {
@@ -55,6 +56,7 @@ impl fmt::Display for Error {
             Error::Error(err) => {
                 write!(f, "{}", err)
             }
+            Error::PasswordLoginRejected(code) => write!(f, "password login rejected ({code})"),
         }
     }
 }
@@ -63,7 +65,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::ReqwestError(err) => Some(err),
-            Error::Error(_) => None,
+            Error::Error(_) | Error::PasswordLoginRejected(_) => None,
         }
     }
 }
@@ -690,7 +692,10 @@ impl Client {
             )));
         }
         if let Some(error) = last_error {
-            return Err(Error::Error(format!("login failed: {error}")));
+            return Err(match error {
+                Error::PasswordLoginRejected(_) => error,
+                _ => Error::Error(format!("login failed: {error}")),
+            });
         }
         Err(Error::Error(
             "no available login method for configured platform".to_string(),
@@ -750,11 +755,10 @@ impl Client {
             .request::<RespLogin>(ApiName::LoginPassword, Some(m))
             .await?;
         match resp.code {
-            0 => Ok(resp.data.unwrap().url),
-            _ => {
-                let msg = resp.message.unwrap();
-                Err(Error::Error(msg))
-            }
+            0 => resp.data.map(|data| data.url).ok_or_else(|| {
+                Error::Error("password login response is incomplete".to_string())
+            }),
+            code => Err(Error::PasswordLoginRejected(code)),
         }
     }
 

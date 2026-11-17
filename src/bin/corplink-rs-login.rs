@@ -2,7 +2,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use corplink_rs::client::{Client, RefreshOutcome};
+use corplink_rs::client::{Client, Error, RefreshOutcome};
 use corplink_rs::config::Config;
 use corplink_rs::login_observer::MachineLoginObserver;
 use corplink_rs::machine::{
@@ -78,6 +78,14 @@ async fn run_login(request: corplink_rs::machine::MachineRequest) -> ExitCode {
 
     match client.login_with_observer(&mut observer).await {
         Ok(()) => ExitCode::SUCCESS,
+        Err(Error::PasswordLoginRejected(code)) => {
+            write_machine_error_message(
+                &format!("FEILIAN_LOGIN_{code}"),
+                "The Feilian server rejected the password login request.",
+            );
+            eprintln!("machine password login was rejected");
+            ExitCode::from(1)
+        }
         Err(error) => {
             write_machine_error_message("LOGIN_FAILED", &error.to_string());
             eprintln!("machine login did not complete");
@@ -194,7 +202,7 @@ fn write_machine_error(code: &'static str, message: &'static str) {
     write_machine_error_message(code, message);
 }
 
-fn write_machine_error_message(code: &'static str, message: &str) {
+fn write_machine_error_message(code: &str, message: &str) {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let mut event = MachineEvent::new(corplink_rs::machine::Event::Error);
